@@ -9,3 +9,8 @@ venv/
 
 # Keep projects.json.example but ignore local config
 projects.json
+
+# IDE
+.idea/
+.vscode/
+*.swp

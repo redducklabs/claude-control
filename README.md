@@ -10,11 +10,33 @@ Claude Control is an MCP server (stdio transport) that exposes tools for dispatc
 - Loads the target project's own `CLAUDE.md`, `.mcp.json`, hooks, and settings
 - Runs with `bypassPermissions` for fully autonomous operation
 
+## Installation
+
+### From PyPI
+
+```bash
+pip install claude-control
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install claude-control
+```
+
+### From Source
+
+```bash
+git clone https://github.com/redducklabs/claude-control.git
+cd claude-control
+pip install .
+```
+
 ## Setup
 
 ### 1. Configure Projects
 
-Copy `projects.json.example` to `projects.json` and edit it:
+Create a `projects.json` file (see `projects.json.example`):
 
 ```json
 {
@@ -33,18 +55,51 @@ Copy `projects.json.example` to `projects.json` and edit it:
 }
 ```
 
-### 2. Register in Your Coordinator Project
+### 2. Register as an MCP Server
 
-Add to the `.mcp.json` of the project where you want coordination tools available:
+Add to the `.mcp.json` of the project where you want coordination tools available.
+
+**Using `uvx` (recommended — no global install needed):**
+
+```json
+{
+  "mcpServers": {
+    "claude_control": {
+      "command": "uvx",
+      "args": ["claude-control"],
+      "env": {
+        "CLAUDE_CONTROL_PROJECTS": "/path/to/your/projects.json"
+      }
+    }
+  }
+}
+```
+
+**Using a pip install:**
+
+```json
+{
+  "mcpServers": {
+    "claude_control": {
+      "command": "claude-control",
+      "env": {
+        "CLAUDE_CONTROL_PROJECTS": "/path/to/your/projects.json"
+      }
+    }
+  }
+}
+```
+
+**Using `python -m`:**
 
 ```json
 {
   "mcpServers": {
     "claude_control": {
       "command": "python",
-      "args": ["D:\\repos\\claude-control\\run_server.py"],
+      "args": ["-m", "claude_control"],
       "env": {
-        "CLAUDE_CONTROL_PROJECTS": "D:\\repos\\claude-control\\projects.json"
+        "CLAUDE_CONTROL_PROJECTS": "/path/to/your/projects.json"
       }
     }
   }
@@ -97,4 +152,4 @@ Check whether a project has an active session, its ID, and turn count.
 
 ## Configuration
 
-The `CLAUDE_CONTROL_PROJECTS` environment variable points to your `projects.json`. If unset, defaults to `projects.json` in the same directory as the package.
+The `CLAUDE_CONTROL_PROJECTS` environment variable points to your `projects.json`. If unset, defaults to `projects.json` in the package's parent directory.
