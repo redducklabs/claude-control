@@ -1,0 +1,14 @@
+{
+  "projects": [
+    {
+      "name": "my-backend",
+      "path": "D:\\repos\\my-backend",
+      "description": "Backend API service"
+    },
+    {
+      "name": "my-frontend",
+      "path": "D:\\repos\\my-frontend",
+      "description": "Frontend web application"
+    }
+  ]
+}
