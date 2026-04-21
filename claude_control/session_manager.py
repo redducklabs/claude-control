@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 # a while, so give this a generous ceiling.
 SEND_TIMEOUT = 300  # 5 minutes
 
+# Max stderr bytes retained for diagnostics. We always drain stderr fully
+# (to prevent pipe-buffer deadlock), but cap what we keep in memory. The
+# retained window is the tail, which is where error output typically lives.
+STDERR_CAP = 64 * 1024
+
 
 @dataclass
 class SessionInfo:
@@ -102,7 +107,18 @@ class SessionManager:
         prompt: str,
         resume_session_id: str | None,
     ) -> SendResult:
-        """Spawn a single `claude -p` subprocess and collect the response."""
+        """Spawn a single `claude -p` subprocess and collect the response.
+
+        Reads stdout and stderr **concurrently** via an anyio task group.
+        Concurrent stderr drainage is required for correctness: the OS pipe
+        buffer is small (often <64 KB on Windows) and a remote claude CLI
+        loading MCP servers, hooks, and project settings routinely emits
+        enough startup chatter on stderr to fill it. If stderr is not read
+        while the child runs, the child blocks on its next stderr write —
+        which means stdout never closes and the parent's stdout loop never
+        exits. Classic subprocess deadlock; the outer SEND_TIMEOUT just
+        masked it as a slow-hang.
+        """
         cmd = self._build_command(prompt, resume_session_id)
         logger.info(
             "Spawning claude for '%s' (cwd=%s, resume=%s)",
@@ -110,6 +126,14 @@ class SessionManager:
             project.path,
             resume_session_id or "none",
         )
+
+        text_parts: list[str] = []
+        final_session_id: str | None = None
+        is_error = False
+        num_turns = 0
+        cost_usd: float | None = None
+        stderr_chunks: list[bytes] = []
+        stderr_total = 0
 
         process: Process | None = None
         try:
@@ -121,67 +145,83 @@ class SessionManager:
                 cwd=project.path,
             )
 
-            text_parts: list[str] = []
-            final_session_id: str | None = None
-            is_error = False
-            num_turns = 0
-            cost_usd: float | None = None
-
             assert process.stdout is not None
-            stdout_stream = TextReceiveStream(process.stdout)
+            assert process.stderr is not None
+            stdout_pipe = process.stdout
+            stderr_pipe = process.stderr
 
-            # Read stdout line by line. Each line is a JSON message.
-            buffer = ""
-            async for chunk in stdout_stream:
-                buffer += chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        logger.debug("Non-JSON output line skipped: %s (%s)", line[:100], e)
-                        continue
+            async def read_stdout() -> None:
+                nonlocal final_session_id, is_error, num_turns, cost_usd
+                stdout_stream = TextReceiveStream(stdout_pipe)
+                buffer = ""
+                async for chunk in stdout_stream:
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError as e:
+                            logger.debug(
+                                "Non-JSON stdout line skipped: %s (%s)", line[:100], e
+                            )
+                            continue
 
-                    msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        # Collect text blocks from assistant messages.
-                        content = msg.get("message", {}).get("content", [])
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    text = block.get("text", "")
-                                    if text:
-                                        text_parts.append(text)
-                    elif msg_type == "result":
-                        # Final message: session_id, cost, error status, turn count.
-                        final_session_id = msg.get("session_id")
-                        is_error = bool(msg.get("is_error", False))
-                        num_turns = msg.get("num_turns", 0) or 0
-                        cost_usd = msg.get("total_cost_usd")
-                    # Other message types (user, system, stream_event, rate_limit_event)
-                    # are ignored — we only care about assistant text and the final result.
+                        msg_type = msg.get("type")
+                        if msg_type == "assistant":
+                            # Collect text blocks from assistant messages.
+                            content = msg.get("message", {}).get("content", [])
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, dict) and block.get("type") == "text":
+                                        text = block.get("text", "")
+                                        if text:
+                                            text_parts.append(text)
+                        elif msg_type == "result":
+                            # Final message: session_id, cost, error status, turn count.
+                            final_session_id = msg.get("session_id")
+                            is_error = bool(msg.get("is_error", False))
+                            num_turns = msg.get("num_turns", 0) or 0
+                            cost_usd = msg.get("total_cost_usd")
+                        # Other message types (user, system, stream_event,
+                        # rate_limit_event) are ignored.
 
-            # Drain any trailing buffered content (should be empty normally).
-            if buffer.strip():
-                logger.debug("Unterminated trailing output: %s", buffer[:200])
+                if buffer.strip():
+                    logger.debug("Unterminated trailing stdout: %s", buffer[:200])
 
-            # Wait for the process to exit and check for errors.
+            async def read_stderr() -> None:
+                """Drain stderr continuously. Retain a rolling tail for diagnostics."""
+                nonlocal stderr_total
+                async for chunk_bytes in stderr_pipe:
+                    stderr_chunks.append(chunk_bytes)
+                    stderr_total += len(chunk_bytes)
+                    # Trim oldest chunks once over cap; keep the tail, which
+                    # is where error output typically lives.
+                    while stderr_total > STDERR_CAP and len(stderr_chunks) > 1:
+                        dropped = stderr_chunks.pop(0)
+                        stderr_total -= len(dropped)
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(read_stdout)
+                tg.start_soon(read_stderr)
+
+            # Both readers finish only when the subprocess closes both pipes,
+            # which happens on exit. wait() is then cheap.
             returncode = await process.wait()
+            stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+
+            if stderr_text.strip():
+                logger.debug(
+                    "stderr for '%s' (returncode=%d, ~%d bytes retained): %s",
+                    project.name,
+                    returncode,
+                    len(stderr_text),
+                    stderr_text[:1024],
+                )
+
             if returncode != 0:
-                stderr_text = ""
-                if process.stderr is not None:
-                    try:
-                        stderr_bytes = b""
-                        async for chunk_bytes in process.stderr:
-                            stderr_bytes += chunk_bytes
-                            if len(stderr_bytes) > 16384:
-                                break
-                        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-                    except Exception:
-                        pass
                 logger.error(
                     "claude subprocess for '%s' exited with code %d; stderr: %s",
                     project.name,
@@ -201,7 +241,7 @@ class SessionManager:
                 cost_usd=cost_usd,
             )
         finally:
-            # Best-effort cleanup if we exit abnormally.
+            # Best-effort cleanup if we exit abnormally (timeout, cancellation).
             if process is not None and process.returncode is None:
                 try:
                     process.terminate()
