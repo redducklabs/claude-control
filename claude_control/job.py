@@ -20,9 +20,11 @@ masked it as a slow-hang. Concurrent drain inside an
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from subprocess import DEVNULL, PIPE
 from typing import Optional
 
@@ -44,6 +46,13 @@ STDERR_CAP = 64 * 1024
 # additional text is dropped silently. Callers needing the full transcript
 # should consult the live stream-json on disk (TODO: add file logging).
 STDOUT_TEXT_CAP = 1 * 1024 * 1024  # 1 MB
+
+DEFAULT_ARTIFACT_ROOT = Path(
+    os.environ.get(
+        "CLAUDE_CONTROL_ARTIFACT_DIR",
+        str(Path.home() / ".cache" / "claude-control" / "artifacts"),
+    )
+)
 
 # Grace period for the subprocess to exit after terminate() before we kill().
 TERMINATE_GRACE_SECONDS = 5
@@ -87,6 +96,8 @@ class JobInfo:
     is_error: bool
     error_message: Optional[str]
     stderr_tail: str
+    artifact_path: Optional[str]
+    artifact_char_count: int
     cancelled: bool
     prompt_chars: int
     resume_session_id: Optional[str]
@@ -124,6 +135,7 @@ class Job:
         agent: AgentKind | str = AgentKind.CLAUDE,
         runner: Optional[AgentRunner] = None,
         resume_session_id: Optional[str] = None,
+        artifact_root: Optional[str | Path] = None,
     ) -> None:
         self.job_id = job_id
         self.project = project
@@ -147,6 +159,9 @@ class Job:
         self.cost_usd: Optional[float] = None
         self.returncode: Optional[int] = None
         self.error_message: Optional[str] = None
+        root = Path(artifact_root) if artifact_root is not None else DEFAULT_ARTIFACT_ROOT
+        self.artifact_path = self._build_artifact_path(root)
+        self.artifact_char_count = 0
 
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
@@ -195,6 +210,8 @@ class Job:
             is_error=self.is_error,
             error_message=self.error_message,
             stderr_tail=stderr_text[-2048:],
+            artifact_path=str(self.artifact_path),
+            artifact_char_count=self.artifact_char_count,
             cancelled=self.cancel_requested,
             prompt_chars=len(self.prompt),
             resume_session_id=self.resume_session_id,
@@ -223,6 +240,27 @@ class Job:
 
     def _build_argv(self) -> list[str]:
         return self.runner.build_argv(self.prompt, self.resume_session_id)
+
+    def _build_artifact_path(self, artifact_root: Path) -> Path:
+        safe_project = "".join(
+            c if c.isalnum() or c in ("-", "_", ".") else "_"
+            for c in self.project.name
+        )
+        return artifact_root / safe_project / self.agent.value / self.job_id / "response.md"
+
+    def _append_artifact_text(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            self.artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.artifact_path.open("a", encoding="utf-8") as f:
+                if self.artifact_char_count > 0:
+                    f.write("\n")
+                    self.artifact_char_count += 1
+                f.write(text)
+            self.artifact_char_count += len(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Job %s could not write artifact: %s", self.job_id, exc)
 
     async def run(self) -> None:
         """Execute the subprocess to terminal state. Sets ``self.state``.
@@ -372,6 +410,7 @@ class Job:
 
         if parsed.text_parts:
             for text in parsed.text_parts:
+                self._append_artifact_text(text)
                 if text and self._text_chars < STDOUT_TEXT_CAP:
                     self.text_parts.append(text)
                     self._text_chars += len(text)

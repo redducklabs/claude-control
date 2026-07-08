@@ -24,6 +24,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import anyio
@@ -39,6 +40,12 @@ logger = logging.getLogger(__name__)
 # work; long jobs survive a wait timeout and are reachable via
 # ``get_job_status``.
 DEFAULT_WAIT_TIMEOUT = float(os.environ.get("CLAUDE_CONTROL_WAIT_TIMEOUT", "600"))
+DEFAULT_ARTIFACT_ROOT = Path(
+    os.environ.get(
+        "CLAUDE_CONTROL_ARTIFACT_DIR",
+        str(Path.home() / ".cache" / "claude-control" / "artifacts"),
+    )
+)
 
 
 @dataclass
@@ -67,8 +74,12 @@ class JobManager:
         *,
         cli_command: Optional[list[str]] = None,
         cli_commands: Optional[dict[AgentKind | str, list[str]]] = None,
+        artifact_root: Optional[str | Path] = None,
     ) -> None:
         self.projects = projects
+        self.artifact_root = (
+            Path(artifact_root) if artifact_root is not None else DEFAULT_ARTIFACT_ROOT
+        )
         self._cli_commands: dict[AgentKind, list[str]] = {}
         if cli_commands is not None:
             for key, command in cli_commands.items():
@@ -141,6 +152,7 @@ class JobManager:
             cli_command=self._get_cli_command(agent_kind),
             agent=agent_kind,
             resume_session_id=resume_id,
+            artifact_root=self.artifact_root,
         )
         self._jobs[job_id] = job
 

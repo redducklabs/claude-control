@@ -42,6 +42,7 @@ def _make_job(project, prompt="hi", resume_session_id=None, job_id="job-1"):
         prompt=prompt,
         cli_command=CLI_COMMAND,
         resume_session_id=resume_session_id,
+        artifact_root=Path(project.path) / ".artifacts",
     )
 
 
@@ -53,6 +54,7 @@ def _make_codex_job(project, prompt="hi", resume_session_id=None, job_id="job-1"
         cli_command=CODEX_COMMAND,
         agent=AgentKind.CODEX,
         resume_session_id=resume_session_id,
+        artifact_root=Path(project.path) / ".artifacts",
     )
 
 
@@ -76,6 +78,9 @@ async def test_run_completes_and_records_state(project, monkeypatch):
     assert job.started_at is not None
     assert job.finished_at is not None
     assert job.last_activity_at is not None
+    assert job.artifact_path.exists()
+    assert job.artifact_path.read_text() == "all done"
+    assert job.artifact_char_count == len("all done")
 
 
 @pytest.mark.anyio

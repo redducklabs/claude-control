@@ -123,8 +123,26 @@ Send a prompt to a Claude Code or Codex instance in the specified project direct
 | `project` | string | Project name (from projects.json) |
 | `prompt` | string | The prompt to send |
 | `agent` | string | Optional. `claude` (default) or `codex` |
+| `include_text` | boolean | Optional. Include assistant text in the response. Defaults to `true` for `send_command` |
+| `text_limit` | number | Optional. Maximum assistant-text characters returned. Defaults to 4000 |
 
-Returns the full text response from the remote instance. Sessions persist across calls per project and per agent — Claude and Codex do not share session history.
+Returns job metadata plus a bounded tail of assistant text by default. Sessions persist across calls per project and per agent — Claude and Codex do not share session history.
+
+To reduce token usage, status/list tools omit assistant text unless `include_text=true`; `send_command` and `wait_for_job` include only the last `text_limit` characters by default. Set `include_text=false` for fire-and-forget orchestration, or raise `text_limit` only when the host agent needs the remote agent's full answer.
+
+Each job also writes assistant text to a local artifact file and returns `artifact_path`, `artifact_char_count`, and `artifact_available`. By default artifacts are stored under `~/.cache/claude-control/artifacts`; override this with `CLAUDE_CONTROL_ARTIFACT_DIR`.
+
+### `read_job_artifact`
+
+Read a bounded slice of a job's assistant-text artifact.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `job_id` | string | Job ID returned by `start_job` or `send_command` |
+| `max_chars` | number | Optional. Maximum characters to return. Defaults to 12000 |
+| `offset` | number | Optional. Character offset to start reading from |
+
+Use this when the host agent needs detailed output after a compact status call. The response includes `text`, `next_offset`, and `has_more` for chunked reads.
 
 ### `list_projects`
 
