@@ -21,15 +21,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import anyio
 
+from .agents import AgentKind, find_claude_cli, find_codex_cli, parse_agent
 from .config import ProjectConfig
 from .job import Job, JobInfo, JobState
 
@@ -54,25 +53,6 @@ class WaitResult:
     wait_status: str  # "completed" | "wait_timeout" | "idle_timeout"
 
 
-def _find_claude_cli() -> str:
-    cli = shutil.which("claude")
-    if cli:
-        return cli
-    candidates = [
-        Path.home() / ".local/bin/claude.exe",  # Windows
-        Path.home() / ".local/bin/claude",
-        Path.home() / ".npm-global/bin/claude",
-        Path("/usr/local/bin/claude"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file():
-            return str(p)
-    raise FileNotFoundError(
-        "claude CLI not found on PATH. "
-        "Install with: npm install -g @anthropic-ai/claude-code"
-    )
-
-
 class JobManager:
     """Owns the live :class:`Job` registry and per-project default sessions.
 
@@ -86,22 +66,27 @@ class JobManager:
         projects: dict[str, ProjectConfig],
         *,
         cli_command: Optional[list[str]] = None,
+        cli_commands: Optional[dict[AgentKind | str, list[str]]] = None,
     ) -> None:
         self.projects = projects
-        if cli_command is None:
-            self._cli_command: list[str] = [_find_claude_cli()]
-        else:
+        self._cli_commands: dict[AgentKind, list[str]] = {}
+        if cli_commands is not None:
+            for key, command in cli_commands.items():
+                agent = parse_agent(key)
+                if not command:
+                    raise ValueError("cli_command must contain at least one element")
+                self._cli_commands[agent] = list(command)
+        if cli_command is not None:
             if not cli_command:
                 raise ValueError("cli_command must contain at least one element")
-            self._cli_command = list(cli_command)
+            self._cli_commands[AgentKind.CLAUDE] = list(cli_command)
 
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, asyncio.Task] = {}
-        self._project_default_session: dict[str, str] = {}
+        self._project_default_session: dict[tuple[AgentKind, str], str] = {}
 
         logger.info(
-            "JobManager initialized (cli=%s, projects=%s)",
-            " ".join(self._cli_command),
+            "JobManager initialized (projects=%s)",
             list(projects.keys()),
         )
 
@@ -114,6 +99,7 @@ class JobManager:
         project_name: str,
         prompt: str,
         *,
+        agent: AgentKind | str = AgentKind.CLAUDE,
         session_id: Optional[str] = None,
         use_default_session: bool = True,
     ) -> str:
@@ -121,7 +107,7 @@ class JobManager:
 
         Args:
             project_name: The project to dispatch into.
-            prompt: The prompt text passed to ``claude -p``.
+            prompt: The prompt text passed to the selected agent CLI.
             session_id: Explicit ``--resume`` target. Wins over
                 ``use_default_session``.
             use_default_session: If True (default) and ``session_id`` is
@@ -137,11 +123,13 @@ class JobManager:
                 f"Available: {', '.join(sorted(self.projects.keys()))}"
             )
 
+        agent_kind = parse_agent(agent)
+
         # Resolve resume target
         if session_id is not None:
             resume_id: Optional[str] = session_id
         elif use_default_session:
-            resume_id = self._project_default_session.get(project_name)
+            resume_id = self._project_default_session.get((agent_kind, project_name))
         else:
             resume_id = None
 
@@ -150,7 +138,8 @@ class JobManager:
             job_id=job_id,
             project=self.projects[project_name],
             prompt=prompt,
-            cli_command=self._cli_command,
+            cli_command=self._get_cli_command(agent_kind),
+            agent=agent_kind,
             resume_session_id=resume_id,
         )
         self._jobs[job_id] = job
@@ -160,7 +149,7 @@ class JobManager:
         # — the running task must outlive the MCP tool call that started it.
         loop = asyncio.get_running_loop()
         task = loop.create_task(
-            self._run_job(job), name=f"claude-control-job-{job_id}"
+            self._run_job(job), name=f"claude-control-{agent_kind.value}-job-{job_id}"
         )
         self._tasks[job_id] = task
         # Add a done callback to avoid "Task exception was never retrieved"
@@ -172,11 +161,24 @@ class JobManager:
         logger.info(
             "Job %s queued (project=%s, resume=%s, prompt_chars=%d)",
             job_id,
-            project_name,
+            f"{agent_kind.value}:{project_name}",
             resume_id or "none",
             len(prompt),
         )
         return job_id
+
+    def _get_cli_command(self, agent: AgentKind) -> list[str]:
+        command = self._cli_commands.get(agent)
+        if command is not None:
+            return list(command)
+        if agent == AgentKind.CLAUDE:
+            command = [find_claude_cli()]
+        elif agent == AgentKind.CODEX:
+            command = [find_codex_cli()]
+        else:  # pragma: no cover
+            raise ValueError(f"Unsupported agent: {agent}")
+        self._cli_commands[agent] = command
+        return list(command)
 
     async def _run_job(self, job: Job) -> None:
         """Inner runner: execute the job, then update the project's default
@@ -188,9 +190,10 @@ class JobManager:
         ):
             sid = job.final_session_id or job.session_id
             assert sid is not None
-            self._project_default_session[job.project.name] = sid
+            self._project_default_session[(job.agent, job.project.name)] = sid
             logger.info(
-                "Project '%s' default session updated to %s",
+                "Project '%s:%s' default session updated to %s",
+                job.agent.value,
                 job.project.name,
                 sid,
             )
@@ -218,11 +221,15 @@ class JobManager:
     def list_jobs(
         self,
         project_name: Optional[str] = None,
+        agent: Optional[AgentKind | str] = None,
         state: Optional[JobState] = None,
     ) -> list[JobInfo]:
+        agent_kind = parse_agent(agent) if agent is not None else None
         out: list[JobInfo] = []
         for job in self._jobs.values():
             if project_name and job.project.name != project_name:
+                continue
+            if agent_kind and job.agent != agent_kind:
                 continue
             if state and job.state != state:
                 continue
@@ -361,18 +368,30 @@ class JobManager:
     # Per-project default sessions
     # ------------------------------------------------------------------
 
-    def get_default_session(self, project_name: str) -> Optional[str]:
+    def get_default_session(
+        self,
+        project_name: str,
+        agent: AgentKind | str = AgentKind.CLAUDE,
+    ) -> Optional[str]:
         if project_name not in self.projects:
             return None
-        return self._project_default_session.get(project_name)
+        return self._project_default_session.get((parse_agent(agent), project_name))
 
-    def reset_default_session(self, project_name: str) -> bool:
+    def reset_default_session(
+        self,
+        project_name: str,
+        agent: AgentKind | str = AgentKind.CLAUDE,
+    ) -> bool:
         if project_name not in self.projects:
             return False
-        sid = self._project_default_session.pop(project_name, None)
+        agent_kind = parse_agent(agent)
+        sid = self._project_default_session.pop((agent_kind, project_name), None)
         if sid is not None:
             logger.info(
-                "Reset default session for '%s' (was %s)", project_name, sid
+                "Reset default session for '%s:%s' (was %s)",
+                agent_kind.value,
+                project_name,
+                sid,
             )
             return True
         return False
@@ -406,6 +425,7 @@ class JobManager:
         project_name: str,
         prompt: str,
         *,
+        agent: AgentKind | str = AgentKind.CLAUDE,
         timeout_seconds: float = DEFAULT_WAIT_TIMEOUT,
         idle_timeout_seconds: Optional[float] = None,
         session_id: Optional[str] = None,
@@ -421,6 +441,7 @@ class JobManager:
         job_id = self.start_job(
             project_name,
             prompt,
+            agent=agent,
             session_id=session_id,
             use_default_session=use_default_session,
         )

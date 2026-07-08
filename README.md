@@ -1,14 +1,16 @@
 # Claude Control
 
-MCP server that lets a Claude Code session coordinate with Claude Code instances running in other project directories.
+MCP server that lets a Claude Code session coordinate with Claude Code or Codex instances running in other project directories.
 
 ## How It Works
 
-Claude Control is an MCP server (stdio transport) that exposes tools for dispatching prompts to Claude Code instances in configured project directories. Each remote instance:
+Claude Control is an MCP server (stdio transport) that exposes tools for dispatching prompts to Claude Code or Codex instances in configured project directories. Each remote instance:
 
 - Runs as a persistent subprocess with conversation context preserved across calls
-- Loads the target project's own `CLAUDE.md`, `.mcp.json`, hooks, and settings
-- Runs with `bypassPermissions` for fully autonomous operation
+- Loads the target project's own context files and settings
+- Runs fully autonomously by default
+
+Claude jobs use the target project as the subprocess working directory. Codex jobs additionally pass `--cd <target-project-path>` so Codex discovers the target project's `AGENTS.md`, `.codex/config.toml`, hooks, and project root even when this MCP server is launched from a different coordinating project.
 
 ## Installation
 
@@ -114,14 +116,15 @@ The tools will appear as `mcp__claude_control__send_command`, `mcp__claude_contr
 
 ### `send_command`
 
-Send a prompt to a Claude Code instance in the specified project directory.
+Send a prompt to a Claude Code or Codex instance in the specified project directory.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `project` | string | Project name (from projects.json) |
 | `prompt` | string | The prompt to send |
+| `agent` | string | Optional. `claude` (default) or `codex` |
 
-Returns the full text response from the remote instance. Sessions persist across calls — follow-up prompts have access to prior context.
+Returns the full text response from the remote instance. Sessions persist across calls per project and per agent — Claude and Codex do not share session history.
 
 ### `list_projects`
 
@@ -134,6 +137,7 @@ Tear down a project's Claude Code session. The next `send_command` call creates 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `project` | string | Project name to reset |
+| `agent` | string | Optional. `claude` (default) or `codex` |
 
 ### `get_session_status`
 
@@ -142,6 +146,7 @@ Check whether a project has an active session, its ID, and turn count.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `project` | string | Project name to check |
+| `agent` | string | Optional. `claude` (default) or `codex` |
 
 ## Dependencies
 
@@ -149,6 +154,7 @@ Check whether a project has an active session, its ID, and turn count.
 - `claude-code-sdk >= 0.0.25`
 - `mcp >= 1.12.0`
 - Claude Code CLI installed and on PATH
+- Codex CLI installed, authenticated, and on PATH if using `agent="codex"`
 
 ## Configuration
 

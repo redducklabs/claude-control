@@ -1,6 +1,6 @@
 """Claude Control MCP server.
 
-Exposes a job-oriented API: start a remote ``claude -p`` task, poll its
+Exposes a job-oriented API: start a remote Claude or Codex task, poll its
 status while it runs, wait for completion with optional wall-clock and idle
 timeouts (which do NOT kill the job), or cancel explicitly. The classic
 ``send_command`` is preserved as a convenience wrapper that starts and
@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from .agents import AgentKind, parse_agent
 from .config import load_projects
 from .job import JobInfo
 from .job_manager import JobManager, WaitResult, DEFAULT_WAIT_TIMEOUT
@@ -56,6 +57,7 @@ def _info_dict(info: JobInfo) -> Dict[str, Any]:
     return {
         "job_id": info.job_id,
         "project": info.project,
+        "agent": info.agent.value,
         "state": info.state.value,
         "session_id": info.session_id,
         "resume_session_id": info.resume_session_id,
@@ -87,10 +89,11 @@ def _wait_dict(result: WaitResult) -> Dict[str, Any]:
 async def start_job(
     project: str,
     prompt: str,
+    agent: str = "claude",
     session_id: Optional[str] = None,
     use_default_session: bool = True,
 ) -> Dict[str, Any]:
-    """Start a Claude Code job in the named project. Returns immediately.
+    """Start a Claude Code or Codex job in the named project. Returns immediately.
 
     The job runs in the background as long as the MCP server is alive,
     independent of any waiter. Use ``get_job_status`` to poll, ``wait_for_job``
@@ -100,7 +103,7 @@ async def start_job(
 
     Args:
         project: Name of the project (as defined in projects.json).
-        prompt: The prompt/command to send to the remote Claude instance.
+        prompt: The prompt/command to send to the remote agent instance.
         session_id: Optional explicit ``--resume`` target. Wins over
             ``use_default_session``.
         use_default_session: If True (default) and ``session_id`` is None,
@@ -117,6 +120,7 @@ async def start_job(
         job_id = mgr.start_job(
             project,
             prompt,
+            agent=agent,
             session_id=session_id,
             use_default_session=use_default_session,
         )
@@ -200,12 +204,17 @@ async def cancel_job(job_id: str) -> Dict[str, Any]:
 @mcp.tool()
 async def list_jobs(
     project: Optional[str] = None,
+    agent: Optional[str] = None,
     state: Optional[str] = None,
 ) -> Dict[str, Any]:
     """List jobs, optionally filtered by project name and/or state."""
     mgr = _get_manager()
     try:
         from .job import JobState
+
+        agent_enum: Optional[AgentKind] = None
+        if agent is not None:
+            agent_enum = parse_agent(agent)
 
         state_enum: Optional[JobState] = None
         if state is not None:
@@ -219,7 +228,7 @@ async def list_jobs(
                         f"Valid: {[s.value for s in JobState]}"
                     ),
                 }
-        infos = mgr.list_jobs(project_name=project, state=state_enum)
+        infos = mgr.list_jobs(project_name=project, agent=agent_enum, state=state_enum)
         return {"jobs": [_info_dict(i) for i in infos]}
     except Exception as e:  # noqa: BLE001
         return {"is_error": True, "error_message": str(e)}
@@ -249,6 +258,7 @@ async def cleanup_finished_jobs(
 async def send_command(
     project: str,
     prompt: str,
+    agent: str = "claude",
     timeout_seconds: float = DEFAULT_WAIT_TIMEOUT,
     idle_timeout_seconds: Optional[float] = None,
     session_id: Optional[str] = None,
@@ -280,6 +290,7 @@ async def send_command(
         result = await mgr.send(
             project,
             prompt,
+            agent=agent,
             timeout_seconds=timeout_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
             session_id=session_id,
@@ -304,7 +315,9 @@ async def list_projects() -> Dict[str, Any]:
     projects: List[Dict[str, Any]] = []
     for name, config in mgr.projects.items():
         active_jobs = [
-            i for i in mgr.list_jobs(project_name=name) if not i.state.value in {
+            i
+            for i in mgr.list_jobs(project_name=name)
+            if not i.state.value in {
                 "completed", "failed", "cancelled", "error",
             }
         ]
@@ -314,15 +327,25 @@ async def list_projects() -> Dict[str, Any]:
                 "path": config.path,
                 "description": config.description,
                 "default_session_id": mgr.get_default_session(name),
+                "default_sessions": {
+                    agent.value: mgr.get_default_session(name, agent=agent)
+                    for agent in AgentKind
+                },
                 "active_job_count": len(active_jobs),
                 "active_job_ids": [i.job_id for i in active_jobs],
+                "active_jobs_by_agent": {
+                    agent.value: [
+                        i.job_id for i in active_jobs if i.agent == agent
+                    ]
+                    for agent in AgentKind
+                },
             }
         )
     return {"projects": projects}
 
 
 @mcp.tool()
-async def get_session_status(project: str) -> Dict[str, Any]:
+async def get_session_status(project: str, agent: str = "claude") -> Dict[str, Any]:
     """Return the project's default session id (used as ``--resume`` for
     new jobs unless overridden)."""
     mgr = _get_manager()
@@ -331,16 +354,21 @@ async def get_session_status(project: str) -> Dict[str, Any]:
             "is_error": True,
             "error_message": f"Unknown project: '{project}'",
         }
-    sid = mgr.get_default_session(project)
+    try:
+        agent_kind = parse_agent(agent)
+    except Exception as e:  # noqa: BLE001
+        return {"is_error": True, "error_message": str(e)}
+    sid = mgr.get_default_session(project, agent=agent_kind)
     return {
         "project": project,
+        "agent": agent_kind.value,
         "default_session_id": sid,
         "active": sid is not None,
     }
 
 
 @mcp.tool()
-async def reset_session(project: str) -> Dict[str, Any]:
+async def reset_session(project: str, agent: str = "claude") -> Dict[str, Any]:
     """Clear the project's default session so the next default-session
     job starts a fresh conversation."""
     mgr = _get_manager()
@@ -349,8 +377,12 @@ async def reset_session(project: str) -> Dict[str, Any]:
             "is_error": True,
             "error_message": f"Unknown project: '{project}'",
         }
-    existed = mgr.reset_default_session(project)
-    return {"project": project, "had_session": existed}
+    try:
+        agent_kind = parse_agent(agent)
+    except Exception as e:  # noqa: BLE001
+        return {"is_error": True, "error_message": str(e)}
+    existed = mgr.reset_default_session(project, agent=agent_kind)
+    return {"project": project, "agent": agent_kind.value, "had_session": existed}
 
 
 def main() -> None:
