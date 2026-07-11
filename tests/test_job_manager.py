@@ -15,12 +15,15 @@ from pathlib import Path
 
 import pytest
 
+from claude_control.agents import AgentKind
 from claude_control.config import ProjectConfig
 from claude_control.job import JobState
 from claude_control.job_manager import JobManager
 
 FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
+FAKE_CODEX = Path(__file__).parent / "fake_codex.py"
 CLI_COMMAND = [sys.executable, str(FAKE_CLAUDE)]
+CODEX_COMMAND = [sys.executable, str(FAKE_CODEX)]
 
 
 @pytest.fixture
@@ -49,6 +52,18 @@ def _make_manager(projects):
     if not isinstance(projects, dict):
         projects = {projects.name: projects}
     return JobManager(projects=projects, cli_command=CLI_COMMAND)
+
+
+def _make_dual_manager(projects):
+    if not isinstance(projects, dict):
+        projects = {projects.name: projects}
+    return JobManager(
+        projects=projects,
+        cli_commands={
+            AgentKind.CLAUDE: CLI_COMMAND,
+            AgentKind.CODEX: CODEX_COMMAND,
+        },
+    )
 
 
 # ----------------------------------------------------------------------
@@ -232,6 +247,24 @@ async def test_default_session_set_after_first_success(project, monkeypatch):
     await mgr.wait_for_job(job_id, max_wait_seconds=10)
 
     assert mgr.get_default_session(project.name) == "sess-default-1"
+
+
+@pytest.mark.anyio
+async def test_default_sessions_are_isolated_by_agent(project, monkeypatch):
+    mgr = _make_dual_manager(project)
+
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "ok")
+    monkeypatch.setenv("FAKE_CLAUDE_SESSION_ID", "claude-default")
+    j1 = mgr.start_job(project.name, "first")
+    await mgr.wait_for_job(j1, max_wait_seconds=10)
+
+    monkeypatch.setenv("FAKE_CODEX_MODE", "ok")
+    monkeypatch.setenv("FAKE_CODEX_THREAD_ID", "codex-default")
+    j2 = mgr.start_job(project.name, "second", agent=AgentKind.CODEX)
+    await mgr.wait_for_job(j2, max_wait_seconds=10)
+
+    assert mgr.get_default_session(project.name) == "claude-default"
+    assert mgr.get_default_session(project.name, agent=AgentKind.CODEX) == "codex-default"
 
 
 @pytest.mark.anyio

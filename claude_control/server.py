@@ -1,6 +1,6 @@
 """Claude Control MCP server.
 
-Exposes a job-oriented API: start a remote ``claude -p`` task, poll its
+Exposes a job-oriented API: start a remote Claude or Codex task, poll its
 status while it runs, wait for completion with optional wall-clock and idle
 timeouts (which do NOT kill the job), or cancel explicitly. The classic
 ``send_command`` is preserved as a convenience wrapper that starts and
@@ -14,11 +14,14 @@ path crashes on ``Optional[...]``.
 """
 
 import logging
+import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from .agents import AgentKind, parse_agent
 from .config import load_projects
 from .job import JobInfo
 from .job_manager import JobManager, WaitResult, DEFAULT_WAIT_TIMEOUT
@@ -33,6 +36,12 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("Claude Control")
 
 _manager: Optional[JobManager] = None
+
+DEFAULT_TEXT_LIMIT = int(os.environ.get("CLAUDE_CONTROL_TEXT_LIMIT", "4000"))
+MAX_TEXT_LIMIT = int(os.environ.get("CLAUDE_CONTROL_MAX_TEXT_LIMIT", "50000"))
+DEFAULT_ARTIFACT_READ_LIMIT = int(
+    os.environ.get("CLAUDE_CONTROL_ARTIFACT_READ_LIMIT", "12000")
+)
 
 
 def _get_manager() -> JobManager:
@@ -51,15 +60,45 @@ def _get_manager() -> JobManager:
     return _manager
 
 
-def _info_dict(info: JobInfo) -> Dict[str, Any]:
+def _bounded_limit(text_limit: int) -> int:
+    if text_limit < 0:
+        return MAX_TEXT_LIMIT
+    return min(text_limit, MAX_TEXT_LIMIT)
+
+
+def _tail_text(text: str, text_limit: int) -> str:
+    limit = _bounded_limit(text_limit)
+    if limit == 0 or len(text) <= limit:
+        return text[:limit]
+    return text[-limit:]
+
+
+def _info_dict(
+    info: JobInfo,
+    *,
+    include_text: bool = False,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
+) -> Dict[str, Any]:
     """Render a :class:`JobInfo` as a JSON-friendly dict for MCP responses."""
-    return {
+    text_len = len(info.text_so_far)
+    limit = _bounded_limit(text_limit)
+    out: Dict[str, Any] = {
         "job_id": info.job_id,
         "project": info.project,
+        "agent": info.agent.value,
         "state": info.state.value,
         "session_id": info.session_id,
         "resume_session_id": info.resume_session_id,
-        "text_so_far": info.text_so_far,
+        "text_char_count": text_len,
+        "text_included": include_text,
+        "text_omitted": not include_text and text_len > 0,
+        "text_truncated": include_text and text_len > limit,
+        "artifact_path": info.artifact_path,
+        "artifact_char_count": info.artifact_char_count,
+        "artifact_available": bool(
+            info.artifact_path and Path(info.artifact_path).exists()
+        ),
         "started_at": info.started_at,
         "finished_at": info.finished_at,
         "last_activity_at": info.last_activity_at,
@@ -68,14 +107,33 @@ def _info_dict(info: JobInfo) -> Dict[str, Any]:
         "cost_usd": info.cost_usd,
         "is_error": info.is_error,
         "error_message": info.error_message,
-        "stderr_tail": info.stderr_tail,
         "cancelled": info.cancelled,
         "prompt_chars": info.prompt_chars,
     }
+    if include_text:
+        out["text_so_far"] = _tail_text(info.text_so_far, text_limit)
+        out["text_limit"] = limit
+    if include_stderr or info.is_error:
+        out["stderr_tail"] = info.stderr_tail
+    return out
 
 
-def _wait_dict(result: WaitResult) -> Dict[str, Any]:
-    return {"wait_status": result.wait_status, **_info_dict(result.info)}
+def _wait_dict(
+    result: WaitResult,
+    *,
+    include_text: bool = True,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "wait_status": result.wait_status,
+        **_info_dict(
+            result.info,
+            include_text=include_text,
+            text_limit=text_limit,
+            include_stderr=include_stderr,
+        ),
+    }
 
 
 # ----------------------------------------------------------------------
@@ -87,10 +145,11 @@ def _wait_dict(result: WaitResult) -> Dict[str, Any]:
 async def start_job(
     project: str,
     prompt: str,
+    agent: str = "claude",
     session_id: Optional[str] = None,
     use_default_session: bool = True,
 ) -> Dict[str, Any]:
-    """Start a Claude Code job in the named project. Returns immediately.
+    """Start a Claude Code or Codex job in the named project. Returns immediately.
 
     The job runs in the background as long as the MCP server is alive,
     independent of any waiter. Use ``get_job_status`` to poll, ``wait_for_job``
@@ -100,7 +159,7 @@ async def start_job(
 
     Args:
         project: Name of the project (as defined in projects.json).
-        prompt: The prompt/command to send to the remote Claude instance.
+        prompt: The prompt/command to send to the remote agent instance.
         session_id: Optional explicit ``--resume`` target. Wins over
             ``use_default_session``.
         use_default_session: If True (default) and ``session_id`` is None,
@@ -117,6 +176,7 @@ async def start_job(
         job_id = mgr.start_job(
             project,
             prompt,
+            agent=agent,
             session_id=session_id,
             use_default_session=use_default_session,
         )
@@ -127,17 +187,74 @@ async def start_job(
 
 
 @mcp.tool()
-async def get_job_status(job_id: str) -> Dict[str, Any]:
+async def get_job_status(
+    job_id: str,
+    include_text: bool = False,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
+) -> Dict[str, Any]:
     """Return current status of a job.
 
-    Includes ``state`` (pending|running|completed|failed|cancelled|error),
-    the latest ``session_id`` observed, accumulated assistant text so far,
-    timing, returncode (if finished), cost/turns (from the result message),
-    and a tail of stderr for diagnostics.
+    By default this returns metadata only to keep MCP responses small. Set
+    ``include_text=True`` to include a bounded tail of assistant text.
     """
     mgr = _get_manager()
     try:
-        return _info_dict(mgr.get_job_info(job_id))
+        return _info_dict(
+            mgr.get_job_info(job_id),
+            include_text=include_text,
+            text_limit=text_limit,
+            include_stderr=include_stderr,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"is_error": True, "error_message": str(e)}
+
+
+@mcp.tool()
+async def read_job_artifact(
+    job_id: str,
+    max_chars: int = DEFAULT_ARTIFACT_READ_LIMIT,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Read a bounded slice of a job's assistant-text artifact.
+
+    Use this when status responses report ``artifact_available=true`` and
+    ``artifact_char_count`` is larger than the host agent wants in every poll.
+    """
+    mgr = _get_manager()
+    try:
+        info = mgr.get_job_info(job_id)
+        if not info.artifact_path:
+            return {
+                "is_error": True,
+                "error_message": "No artifact path recorded for job",
+            }
+
+        artifact_path = Path(info.artifact_path)
+        if not artifact_path.exists():
+            return {
+                "is_error": True,
+                "error_message": f"Artifact does not exist: {artifact_path}",
+                "artifact_path": str(artifact_path),
+            }
+
+        limit = _bounded_limit(max_chars)
+        start = max(0, offset)
+        text = artifact_path.read_text(encoding="utf-8", errors="replace")
+        chunk = text[start : start + limit]
+        next_offset = start + len(chunk)
+        return {
+            "job_id": info.job_id,
+            "project": info.project,
+            "agent": info.agent.value,
+            "artifact_path": str(artifact_path),
+            "artifact_char_count": len(text),
+            "offset": start,
+            "max_chars": limit,
+            "next_offset": next_offset,
+            "has_more": next_offset < len(text),
+            "text": chunk,
+        }
     except Exception as e:  # noqa: BLE001
         return {"is_error": True, "error_message": str(e)}
 
@@ -147,6 +264,9 @@ async def wait_for_job(
     job_id: str,
     max_wait_seconds: float = DEFAULT_WAIT_TIMEOUT,
     idle_timeout_seconds: Optional[float] = None,
+    include_text: bool = True,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
 ) -> Dict[str, Any]:
     """Block until a job is finished, or until a wait limit fires.
 
@@ -176,14 +296,24 @@ async def wait_for_job(
             max_wait_seconds=max_wait_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
         )
-        return _wait_dict(result)
+        return _wait_dict(
+            result,
+            include_text=include_text,
+            text_limit=text_limit,
+            include_stderr=include_stderr,
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception("wait_for_job failed for job '%s'", job_id)
         return {"is_error": True, "error_message": str(e)}
 
 
 @mcp.tool()
-async def cancel_job(job_id: str) -> Dict[str, Any]:
+async def cancel_job(
+    job_id: str,
+    include_text: bool = False,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
+) -> Dict[str, Any]:
     """Cancel a running job, terminating its subprocess.
 
     Returns ``{"cancelled": true}`` if a running job was cancelled,
@@ -192,7 +322,15 @@ async def cancel_job(job_id: str) -> Dict[str, Any]:
     mgr = _get_manager()
     try:
         cancelled = await mgr.cancel_job(job_id)
-        return {"cancelled": cancelled, **_info_dict(mgr.get_job_info(job_id))}
+        return {
+            "cancelled": cancelled,
+            **_info_dict(
+                mgr.get_job_info(job_id),
+                include_text=include_text,
+                text_limit=text_limit,
+                include_stderr=include_stderr,
+            ),
+        }
     except Exception as e:  # noqa: BLE001
         return {"is_error": True, "error_message": str(e)}
 
@@ -200,12 +338,20 @@ async def cancel_job(job_id: str) -> Dict[str, Any]:
 @mcp.tool()
 async def list_jobs(
     project: Optional[str] = None,
+    agent: Optional[str] = None,
     state: Optional[str] = None,
+    include_text: bool = False,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
 ) -> Dict[str, Any]:
     """List jobs, optionally filtered by project name and/or state."""
     mgr = _get_manager()
     try:
         from .job import JobState
+
+        agent_enum: Optional[AgentKind] = None
+        if agent is not None:
+            agent_enum = parse_agent(agent)
 
         state_enum: Optional[JobState] = None
         if state is not None:
@@ -219,8 +365,18 @@ async def list_jobs(
                         f"Valid: {[s.value for s in JobState]}"
                     ),
                 }
-        infos = mgr.list_jobs(project_name=project, state=state_enum)
-        return {"jobs": [_info_dict(i) for i in infos]}
+        infos = mgr.list_jobs(project_name=project, agent=agent_enum, state=state_enum)
+        return {
+            "jobs": [
+                _info_dict(
+                    i,
+                    include_text=include_text,
+                    text_limit=text_limit,
+                    include_stderr=include_stderr,
+                )
+                for i in infos
+            ]
+        }
     except Exception as e:  # noqa: BLE001
         return {"is_error": True, "error_message": str(e)}
 
@@ -249,11 +405,15 @@ async def cleanup_finished_jobs(
 async def send_command(
     project: str,
     prompt: str,
+    agent: str = "claude",
     timeout_seconds: float = DEFAULT_WAIT_TIMEOUT,
     idle_timeout_seconds: Optional[float] = None,
     session_id: Optional[str] = None,
     use_default_session: bool = True,
     cancel_on_timeout: bool = False,
+    include_text: bool = True,
+    text_limit: int = DEFAULT_TEXT_LIMIT,
+    include_stderr: bool = False,
 ) -> Dict[str, Any]:
     """Synchronous send: start a job and wait for it. One call.
 
@@ -280,13 +440,19 @@ async def send_command(
         result = await mgr.send(
             project,
             prompt,
+            agent=agent,
             timeout_seconds=timeout_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
             session_id=session_id,
             use_default_session=use_default_session,
             cancel_on_timeout=cancel_on_timeout,
         )
-        return _wait_dict(result)
+        return _wait_dict(
+            result,
+            include_text=include_text,
+            text_limit=text_limit,
+            include_stderr=include_stderr,
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception("send_command failed for project '%s'", project)
         return {"is_error": True, "error_message": str(e)}
@@ -304,7 +470,9 @@ async def list_projects() -> Dict[str, Any]:
     projects: List[Dict[str, Any]] = []
     for name, config in mgr.projects.items():
         active_jobs = [
-            i for i in mgr.list_jobs(project_name=name) if not i.state.value in {
+            i
+            for i in mgr.list_jobs(project_name=name)
+            if not i.state.value in {
                 "completed", "failed", "cancelled", "error",
             }
         ]
@@ -314,15 +482,25 @@ async def list_projects() -> Dict[str, Any]:
                 "path": config.path,
                 "description": config.description,
                 "default_session_id": mgr.get_default_session(name),
+                "default_sessions": {
+                    agent.value: mgr.get_default_session(name, agent=agent)
+                    for agent in AgentKind
+                },
                 "active_job_count": len(active_jobs),
                 "active_job_ids": [i.job_id for i in active_jobs],
+                "active_jobs_by_agent": {
+                    agent.value: [
+                        i.job_id for i in active_jobs if i.agent == agent
+                    ]
+                    for agent in AgentKind
+                },
             }
         )
     return {"projects": projects}
 
 
 @mcp.tool()
-async def get_session_status(project: str) -> Dict[str, Any]:
+async def get_session_status(project: str, agent: str = "claude") -> Dict[str, Any]:
     """Return the project's default session id (used as ``--resume`` for
     new jobs unless overridden)."""
     mgr = _get_manager()
@@ -331,16 +509,21 @@ async def get_session_status(project: str) -> Dict[str, Any]:
             "is_error": True,
             "error_message": f"Unknown project: '{project}'",
         }
-    sid = mgr.get_default_session(project)
+    try:
+        agent_kind = parse_agent(agent)
+    except Exception as e:  # noqa: BLE001
+        return {"is_error": True, "error_message": str(e)}
+    sid = mgr.get_default_session(project, agent=agent_kind)
     return {
         "project": project,
+        "agent": agent_kind.value,
         "default_session_id": sid,
         "active": sid is not None,
     }
 
 
 @mcp.tool()
-async def reset_session(project: str) -> Dict[str, Any]:
+async def reset_session(project: str, agent: str = "claude") -> Dict[str, Any]:
     """Clear the project's default session so the next default-session
     job starts a fresh conversation."""
     mgr = _get_manager()
@@ -349,8 +532,12 @@ async def reset_session(project: str) -> Dict[str, Any]:
             "is_error": True,
             "error_message": f"Unknown project: '{project}'",
         }
-    existed = mgr.reset_default_session(project)
-    return {"project": project, "had_session": existed}
+    try:
+        agent_kind = parse_agent(agent)
+    except Exception as e:  # noqa: BLE001
+        return {"is_error": True, "error_message": str(e)}
+    existed = mgr.reset_default_session(project, agent=agent_kind)
+    return {"project": project, "agent": agent_kind.value, "had_session": existed}
 
 
 def main() -> None:

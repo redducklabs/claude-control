@@ -1,14 +1,14 @@
-"""A single dispatched ``claude -p`` invocation.
+"""A single dispatched agent CLI invocation.
 
-A :class:`Job` owns one subprocess and parses its ``--output-format
-stream-json`` output. State (text accumulator, session_id, last activity
+A :class:`Job` owns one subprocess and parses its structured stream output.
+State (text accumulator, session_id, last activity
 timestamp, etc.) is published live so callers can poll a running job;
 a :class:`anyio.Event` lets waiters block until the job finishes.
 
 Why we read stdout and stderr concurrently
 ------------------------------------------
-The OS pipe buffer is small (often <64 KB on Windows). A remote ``claude``
-CLI loading MCP servers, hooks, and project settings routinely emits enough
+The OS pipe buffer is small (often <64 KB on Windows). A remote agent CLI
+loading MCP servers, hooks, and project settings routinely emits enough
 startup chatter on stderr to fill it. If stderr is not read while the child
 runs, the child blocks on its next stderr write — which means stdout never
 closes and the parent's stdout loop never exits. Classic subprocess
@@ -19,11 +19,12 @@ masked it as a slow-hang. Concurrent drain inside an
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from subprocess import DEVNULL, PIPE
 from typing import Optional
 
@@ -31,6 +32,7 @@ import anyio
 from anyio.abc import Process
 from anyio.streams.text import TextReceiveStream
 
+from .agents import AgentKind, AgentRunner, make_runner, parse_agent
 from .config import ProjectConfig
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,13 @@ STDERR_CAP = 64 * 1024
 # additional text is dropped silently. Callers needing the full transcript
 # should consult the live stream-json on disk (TODO: add file logging).
 STDOUT_TEXT_CAP = 1 * 1024 * 1024  # 1 MB
+
+DEFAULT_ARTIFACT_ROOT = Path(
+    os.environ.get(
+        "CLAUDE_CONTROL_ARTIFACT_DIR",
+        str(Path.home() / ".cache" / "claude-control" / "artifacts"),
+    )
+)
 
 # Grace period for the subprocess to exit after terminate() before we kill().
 TERMINATE_GRACE_SECONDS = 5
@@ -74,6 +83,7 @@ class JobInfo:
 
     job_id: str
     project: str
+    agent: AgentKind
     state: JobState
     session_id: Optional[str]
     text_so_far: str
@@ -86,6 +96,8 @@ class JobInfo:
     is_error: bool
     error_message: Optional[str]
     stderr_tail: str
+    artifact_path: Optional[str]
+    artifact_char_count: int
     cancelled: bool
     prompt_chars: int
     resume_session_id: Optional[str]
@@ -101,7 +113,7 @@ class JobInfo:
 
 
 class Job:
-    """A single ``claude -p`` invocation, run independently of any waiter.
+    """A single agent CLI invocation, run independently of any waiter.
 
     The intended lifecycle is::
 
@@ -120,12 +132,20 @@ class Job:
         project: ProjectConfig,
         prompt: str,
         cli_command: list[str],
+        agent: AgentKind | str = AgentKind.CLAUDE,
+        runner: Optional[AgentRunner] = None,
         resume_session_id: Optional[str] = None,
+        artifact_root: Optional[str | Path] = None,
     ) -> None:
         self.job_id = job_id
         self.project = project
         self.prompt = prompt
-        self.cli_command = list(cli_command)
+        self.agent = parse_agent(agent)
+        self.runner = runner or make_runner(
+            self.agent,
+            project_path=project.path,
+            cli_command=cli_command,
+        )
         self.resume_session_id = resume_session_id
 
         # State (mutated by run())
@@ -139,6 +159,9 @@ class Job:
         self.cost_usd: Optional[float] = None
         self.returncode: Optional[int] = None
         self.error_message: Optional[str] = None
+        root = Path(artifact_root) if artifact_root is not None else DEFAULT_ARTIFACT_ROOT
+        self.artifact_path = self._build_artifact_path(root)
+        self.artifact_char_count = 0
 
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
@@ -174,6 +197,7 @@ class Job:
         return JobInfo(
             job_id=self.job_id,
             project=self.project.name,
+            agent=self.agent,
             state=self.state,
             session_id=self.final_session_id or self.session_id,
             text_so_far="\n".join(self.text_parts),
@@ -186,6 +210,8 @@ class Job:
             is_error=self.is_error,
             error_message=self.error_message,
             stderr_tail=stderr_text[-2048:],
+            artifact_path=str(self.artifact_path),
+            artifact_char_count=self.artifact_char_count,
             cancelled=self.cancel_requested,
             prompt_chars=len(self.prompt),
             resume_session_id=self.resume_session_id,
@@ -213,18 +239,28 @@ class Job:
     # ------------------------------------------------------------------
 
     def _build_argv(self) -> list[str]:
-        argv = list(self.cli_command) + [
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--verbose",  # required by stream-json
-            "--permission-mode",
-            "bypassPermissions",
-        ]
-        if self.resume_session_id:
-            argv.extend(["--resume", self.resume_session_id])
-        argv.extend(["--", self.prompt])
-        return argv
+        return self.runner.build_argv(self.prompt, self.resume_session_id)
+
+    def _build_artifact_path(self, artifact_root: Path) -> Path:
+        safe_project = "".join(
+            c if c.isalnum() or c in ("-", "_", ".") else "_"
+            for c in self.project.name
+        )
+        return artifact_root / safe_project / self.agent.value / self.job_id / "response.md"
+
+    def _append_artifact_text(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            self.artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.artifact_path.open("a", encoding="utf-8") as f:
+                if self.artifact_char_count > 0:
+                    f.write("\n")
+                    self.artifact_char_count += 1
+                f.write(text)
+            self.artifact_char_count += len(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Job %s could not write artifact: %s", self.job_id, exc)
 
     async def run(self) -> None:
         """Execute the subprocess to terminal state. Sets ``self.state``.
@@ -246,7 +282,7 @@ class Job:
         logger.info(
             "Job %s starting (project=%s, cwd=%s, resume=%s, prompt_chars=%d)",
             self.job_id,
-            self.project.name,
+            f"{self.agent.value}:{self.project.name}",
             self.project.path,
             self.resume_session_id or "none",
             len(self.prompt),
@@ -358,9 +394,8 @@ class Job:
             self._process = None
 
     def _handle_stdout_line(self, line: str) -> None:
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
+        parsed = self.runner.parse_stdout_line(line, time.time())
+        if parsed is None:
             logger.debug("Job %s non-JSON stdout: %s", self.job_id, line[:120])
             return
 
@@ -369,27 +404,27 @@ class Job:
         # very early, so observed_session_id is set well before any real
         # work begins. That id is what makes timeout-resume possible.
         self.last_activity_at = time.time()
-        sid = msg.get("session_id")
+        sid = parsed.session_id
         if sid and self.session_id is None:
             self.session_id = sid
 
-        msg_type = msg.get("type")
-        if msg_type == "assistant":
-            content = msg.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "text"
-                    ):
-                        text = block.get("text", "")
-                        if text and self._text_chars < STDOUT_TEXT_CAP:
-                            self.text_parts.append(text)
-                            self._text_chars += len(text)
-        elif msg_type == "result":
-            self.final_session_id = msg.get("session_id")
-            self.is_error = bool(msg.get("is_error", False))
-            self.num_turns = msg.get("num_turns", 0) or 0
-            self.cost_usd = msg.get("total_cost_usd")
+        if parsed.text_parts:
+            for text in parsed.text_parts:
+                self._append_artifact_text(text)
+                if text and self._text_chars < STDOUT_TEXT_CAP:
+                    self.text_parts.append(text)
+                    self._text_chars += len(text)
+        if parsed.saw_result:
+            self.final_session_id = parsed.final_session_id
+            if self.final_session_id is None and self.agent == AgentKind.CODEX:
+                self.final_session_id = self.session_id
+            if parsed.is_error is not None:
+                self.is_error = parsed.is_error
+            if parsed.num_turns is not None:
+                self.num_turns = parsed.num_turns
+            if parsed.cost_usd is not None:
+                self.cost_usd = parsed.cost_usd
+            if parsed.error_message:
+                self.error_message = parsed.error_message
         # Other types (user, system non-init, stream_event, rate_limit_event)
         # are pure liveness signals; we already updated last_activity_at.

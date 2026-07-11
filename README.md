@@ -1,14 +1,18 @@
 # Claude Control
 
-MCP server that lets a Claude Code session coordinate with Claude Code instances running in other project directories.
+MCP server that lets a Claude Code session coordinate with Claude Code or Codex instances running in other project directories.
 
 ## How It Works
 
-Claude Control is an MCP server (stdio transport) that exposes tools for dispatching prompts to Claude Code instances in configured project directories. Each remote instance:
+Claude Control is an MCP server (stdio transport) that exposes tools for dispatching prompts to Claude Code or Codex instances in configured project directories. Each remote instance:
 
 - Runs as a persistent subprocess with conversation context preserved across calls
-- Loads the target project's own `CLAUDE.md`, `.mcp.json`, hooks, and settings
-- Runs with `bypassPermissions` for fully autonomous operation
+- Loads the target project's own context files and settings
+- Runs fully autonomously by default
+
+Claude jobs use the target project as the subprocess working directory. Codex jobs additionally pass `--cd <target-project-path>` so Codex discovers the target project's `AGENTS.md`, `.codex/config.toml`, hooks, and project root even when this MCP server is launched from a different coordinating project.
+
+Codex jobs ignore the user-level Codex config by default because some Codex CLI versions reject HTTP MCP entries such as `[mcp_servers.clickup] url = ...` in non-interactive `codex exec` mode. The target project still loads via `--cd`, and Codex auth still uses `CODEX_HOME`. Set `CLAUDE_CONTROL_CODEX_IGNORE_USER_CONFIG=false` to let Codex load the user config when the local Codex CLI supports it.
 
 ## Installation
 
@@ -114,14 +118,33 @@ The tools will appear as `mcp__claude_control__send_command`, `mcp__claude_contr
 
 ### `send_command`
 
-Send a prompt to a Claude Code instance in the specified project directory.
+Send a prompt to a Claude Code or Codex instance in the specified project directory.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `project` | string | Project name (from projects.json) |
 | `prompt` | string | The prompt to send |
+| `agent` | string | Optional. `claude` (default) or `codex` |
+| `include_text` | boolean | Optional. Include assistant text in the response. Defaults to `true` for `send_command` |
+| `text_limit` | number | Optional. Maximum assistant-text characters returned. Defaults to 4000 |
 
-Returns the full text response from the remote instance. Sessions persist across calls — follow-up prompts have access to prior context.
+Returns job metadata plus a bounded tail of assistant text by default. Sessions persist across calls per project and per agent — Claude and Codex do not share session history.
+
+To reduce token usage, status/list tools omit assistant text unless `include_text=true`; `send_command` and `wait_for_job` include only the last `text_limit` characters by default. Set `include_text=false` for fire-and-forget orchestration, or raise `text_limit` only when the host agent needs the remote agent's full answer.
+
+Each job also writes assistant text to a local artifact file and returns `artifact_path`, `artifact_char_count`, and `artifact_available`. By default artifacts are stored under `~/.cache/claude-control/artifacts`; override this with `CLAUDE_CONTROL_ARTIFACT_DIR`.
+
+### `read_job_artifact`
+
+Read a bounded slice of a job's assistant-text artifact.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `job_id` | string | Job ID returned by `start_job` or `send_command` |
+| `max_chars` | number | Optional. Maximum characters to return. Defaults to 12000 |
+| `offset` | number | Optional. Character offset to start reading from |
+
+Use this when the host agent needs detailed output after a compact status call. The response includes `text`, `next_offset`, and `has_more` for chunked reads.
 
 ### `list_projects`
 
@@ -134,6 +157,7 @@ Tear down a project's Claude Code session. The next `send_command` call creates 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `project` | string | Project name to reset |
+| `agent` | string | Optional. `claude` (default) or `codex` |
 
 ### `get_session_status`
 
@@ -142,6 +166,7 @@ Check whether a project has an active session, its ID, and turn count.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `project` | string | Project name to check |
+| `agent` | string | Optional. `claude` (default) or `codex` |
 
 ## Dependencies
 
@@ -149,6 +174,7 @@ Check whether a project has an active session, its ID, and turn count.
 - `claude-code-sdk >= 0.0.25`
 - `mcp >= 1.12.0`
 - Claude Code CLI installed and on PATH
+- Codex CLI installed, authenticated, and on PATH if using `agent="codex"`
 
 ## Configuration
 

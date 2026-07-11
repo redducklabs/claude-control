@@ -17,9 +17,12 @@ import pytest
 
 from claude_control.config import ProjectConfig
 from claude_control.job import Job, JobState
+from claude_control.agents import AgentKind
 
 FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
+FAKE_CODEX = Path(__file__).parent / "fake_codex.py"
 CLI_COMMAND = [sys.executable, str(FAKE_CLAUDE)]
+CODEX_COMMAND = [sys.executable, str(FAKE_CODEX)]
 
 
 @pytest.fixture
@@ -39,6 +42,19 @@ def _make_job(project, prompt="hi", resume_session_id=None, job_id="job-1"):
         prompt=prompt,
         cli_command=CLI_COMMAND,
         resume_session_id=resume_session_id,
+        artifact_root=Path(project.path) / ".artifacts",
+    )
+
+
+def _make_codex_job(project, prompt="hi", resume_session_id=None, job_id="job-1"):
+    return Job(
+        job_id=job_id,
+        project=project,
+        prompt=prompt,
+        cli_command=CODEX_COMMAND,
+        agent=AgentKind.CODEX,
+        resume_session_id=resume_session_id,
+        artifact_root=Path(project.path) / ".artifacts",
     )
 
 
@@ -62,6 +78,9 @@ async def test_run_completes_and_records_state(project, monkeypatch):
     assert job.started_at is not None
     assert job.finished_at is not None
     assert job.last_activity_at is not None
+    assert job.artifact_path.exists()
+    assert job.artifact_path.read_text() == "all done"
+    assert job.artifact_char_count == len("all done")
 
 
 @pytest.mark.anyio
@@ -202,3 +221,112 @@ async def test_noisy_stderr_does_not_deadlock(project, monkeypatch):
     assert job.state == JobState.COMPLETED, f"got {job.state}: {job.error_message!r}"
     assert "survived noisy stderr" in "\n".join(job.text_parts)
     assert elapsed < 15
+
+
+@pytest.mark.anyio
+async def test_codex_run_completes_and_records_state(project, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_MODE", "ok")
+    monkeypatch.setenv("FAKE_CODEX_THREAD_ID", "codex-thread-ok")
+
+    job = _make_codex_job(project)
+    await job.run()
+
+    assert job.agent == AgentKind.CODEX
+    assert job.state == JobState.COMPLETED
+    assert job.session_id == "codex-thread-ok"
+    assert job.final_session_id == "codex-thread-ok"
+    assert "codex done" in "\n".join(job.text_parts)
+    assert job.returncode == 0
+    assert job.is_error is False
+    assert job.num_turns == 1
+
+
+@pytest.mark.anyio
+async def test_codex_argv_uses_target_cd_and_full_access(project, monkeypatch, tmp_path):
+    argv_dump = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CODEX_MODE", "ok")
+    monkeypatch.setenv("FAKE_CODEX_ARGV_DUMP", str(argv_dump))
+
+    job = _make_codex_job(project)
+    await job.run()
+
+    argv = json.loads(argv_dump.read_text())
+    assert argv[1:6] == [
+        "exec",
+        "--json",
+        "--ignore-user-config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--cd",
+    ]
+    assert argv[6] == project.path
+    assert argv[-2:] == ["--", "hi"]
+
+
+@pytest.mark.anyio
+async def test_codex_ignore_user_config_can_be_disabled(project, monkeypatch, tmp_path):
+    argv_dump = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CODEX_MODE", "ok")
+    monkeypatch.setenv("FAKE_CODEX_ARGV_DUMP", str(argv_dump))
+    monkeypatch.setenv("CLAUDE_CONTROL_CODEX_IGNORE_USER_CONFIG", "false")
+
+    job = _make_codex_job(project)
+    await job.run()
+
+    argv = json.loads(argv_dump.read_text())
+    assert "--ignore-user-config" not in argv
+    assert argv[1:5] == [
+        "exec",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--cd",
+    ]
+
+
+@pytest.mark.anyio
+async def test_codex_resume_session_id_passed_in_argv(project, monkeypatch, tmp_path):
+    argv_dump = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CODEX_MODE", "ok")
+    monkeypatch.setenv("FAKE_CODEX_ARGV_DUMP", str(argv_dump))
+
+    job = _make_codex_job(project, resume_session_id="codex-resume-1")
+    await job.run()
+
+    argv = json.loads(argv_dump.read_text())
+    assert "resume" in argv
+    idx = argv.index("resume")
+    assert argv[idx + 1] == "codex-resume-1"
+    assert argv[idx + 2 : idx + 4] == ["--", "hi"]
+
+
+@pytest.mark.anyio
+async def test_codex_run_records_failure_when_turn_fails(project, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_MODE", "error")
+    monkeypatch.setenv("FAKE_CODEX_THREAD_ID", "codex-thread-err")
+
+    job = _make_codex_job(project)
+    await job.run()
+
+    assert job.state == JobState.FAILED
+    assert job.is_error is True
+    assert job.session_id == "codex-thread-err"
+    assert job.error_message == "codex failed"
+
+
+@pytest.mark.anyio
+async def test_codex_request_cancel_stops_running_job(project, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_MODE", "slow")
+    monkeypatch.setenv("FAKE_CODEX_THREAD_ID", "codex-thread-cancel")
+
+    job = _make_codex_job(project)
+    task = asyncio.create_task(job.run())
+
+    deadline = time.monotonic() + 5
+    while job.session_id is None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert job.session_id == "codex-thread-cancel"
+
+    job.request_cancel()
+    await asyncio.wait_for(task, timeout=15)
+
+    assert job.state == JobState.CANCELLED
+    assert job.session_id == "codex-thread-cancel"
