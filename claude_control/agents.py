@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from abc import ABC, abstractmethod
@@ -108,10 +109,16 @@ class CodexRunner(AgentRunner):
         argv = list(self.cli_command) + [
             "exec",
             "--json",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--cd",
-            self.project_path,
         ]
+        if _codex_ignore_user_config():
+            argv.append("--ignore-user-config")
+        argv.extend(
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--cd",
+                self.project_path,
+            ]
+        )
         if resume_session_id:
             argv.extend(["resume", resume_session_id, "--", prompt])
         else:
@@ -165,6 +172,18 @@ def _codex_error_message(msg: dict[str, Any]) -> str:
     if message:
         return str(message)
     return json.dumps(msg, sort_keys=True)
+
+
+def _codex_ignore_user_config() -> bool:
+    """Avoid user-level MCP config that can prevent non-interactive Codex startup.
+
+    Codex CLI 0.142 rejects HTTP MCP entries such as
+    ``[mcp_servers.clickup] url = ...`` when running ``codex exec``. The child
+    project still loads via ``--cd``; auth remains in CODEX_HOME.
+    """
+
+    raw = os.environ.get("CLAUDE_CONTROL_CODEX_IGNORE_USER_CONFIG", "1")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def find_claude_cli() -> str:

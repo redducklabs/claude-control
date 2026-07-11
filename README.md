@@ -12,6 +12,8 @@ Claude Control is an MCP server (stdio transport) that exposes tools for dispatc
 
 Claude jobs use the target project as the subprocess working directory. Codex jobs additionally pass `--cd <target-project-path>` so Codex discovers the target project's `AGENTS.md`, `.codex/config.toml`, hooks, and project root even when this MCP server is launched from a different coordinating project.
 
+Codex jobs ignore the user-level Codex config by default because some Codex CLI versions reject HTTP MCP entries such as `[mcp_servers.clickup] url = ...` in non-interactive `codex exec` mode. The target project still loads via `--cd`, and Codex auth still uses `CODEX_HOME`. Set `CLAUDE_CONTROL_CODEX_IGNORE_USER_CONFIG=false` to let Codex load the user config when the local Codex CLI supports it.
+
 ## Installation
 
 ### From PyPI

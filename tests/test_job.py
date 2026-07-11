@@ -251,14 +251,35 @@ async def test_codex_argv_uses_target_cd_and_full_access(project, monkeypatch, t
     await job.run()
 
     argv = json.loads(argv_dump.read_text())
+    assert argv[1:6] == [
+        "exec",
+        "--json",
+        "--ignore-user-config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--cd",
+    ]
+    assert argv[6] == project.path
+    assert argv[-2:] == ["--", "hi"]
+
+
+@pytest.mark.anyio
+async def test_codex_ignore_user_config_can_be_disabled(project, monkeypatch, tmp_path):
+    argv_dump = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CODEX_MODE", "ok")
+    monkeypatch.setenv("FAKE_CODEX_ARGV_DUMP", str(argv_dump))
+    monkeypatch.setenv("CLAUDE_CONTROL_CODEX_IGNORE_USER_CONFIG", "false")
+
+    job = _make_codex_job(project)
+    await job.run()
+
+    argv = json.loads(argv_dump.read_text())
+    assert "--ignore-user-config" not in argv
     assert argv[1:5] == [
         "exec",
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
         "--cd",
     ]
-    assert argv[5] == project.path
-    assert argv[-2:] == ["--", "hi"]
 
 
 @pytest.mark.anyio
