@@ -51,7 +51,10 @@ def two_projects(tmp_path):
 def _make_manager(projects):
     if not isinstance(projects, dict):
         projects = {projects.name: projects}
-    return JobManager(projects=projects, cli_command=CLI_COMMAND)
+    artifact_root = Path(next(iter(projects.values())).path) / ".artifacts"
+    return JobManager(
+        projects=projects, cli_command=CLI_COMMAND, artifact_root=artifact_root
+    )
 
 
 def _make_dual_manager(projects):
@@ -59,6 +62,7 @@ def _make_dual_manager(projects):
         projects = {projects.name: projects}
     return JobManager(
         projects=projects,
+        artifact_root=Path(next(iter(projects.values())).path) / ".artifacts",
         cli_commands={
             AgentKind.CLAUDE: CLI_COMMAND,
             AgentKind.CODEX: CODEX_COMMAND,
@@ -345,6 +349,88 @@ async def test_reset_default_session_clears_it(project, monkeypatch):
     assert mgr.reset_default_session(project.name) is True
     assert mgr.get_default_session(project.name) is None
     assert mgr.reset_default_session(project.name) is False  # already gone
+
+
+@pytest.mark.anyio
+async def test_completion_inbox_persists_and_reloads(project, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "ok")
+    artifact_root = Path(project.path) / ".artifacts"
+    mgr = JobManager(
+        {project.name: project}, cli_command=CLI_COMMAND, artifact_root=artifact_root
+    )
+    job_id = mgr.start_job(project.name, "work", job_size="one_off")
+    await mgr.wait_for_job(job_id, max_wait_seconds=10)
+
+    reloaded = JobManager(
+        {project.name: project}, cli_command=CLI_COMMAND, artifact_root=artifact_root
+    )
+    completed, active = reloaded.drain_completion_inbox()
+
+    assert active == []
+    assert [item["job_id"] for item in completed] == [job_id]
+    assert completed[0]["state"] == "completed"
+    assert completed[0]["session_action"] == "resume"
+    assert Path(completed[0]["result_path"]).is_file()
+    assert reloaded.drain_completion_inbox()[0] == []
+
+
+@pytest.mark.anyio
+async def test_failure_receipt_contains_actionable_process_error(project, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "crash")
+    mgr = _make_manager(project)
+    job_id = mgr.start_job(project.name, "work", job_size="one_off")
+    await mgr.wait_for_job(job_id, max_wait_seconds=10)
+
+    completed, _ = mgr.drain_completion_inbox()
+    receipt = next(item for item in completed if item["job_id"] == job_id)
+    assert receipt["state"] == "failed"
+    assert receipt["is_error"] is True
+    assert receipt["error_category"] == "process_exit"
+    assert "code 1" in receipt["error_message"]
+    assert "simulated startup failure" in receipt["stderr_tail"]
+    assert receipt["session_action"] == "retry_or_reset"
+
+
+@pytest.mark.anyio
+async def test_valid_handoff_rotates_next_job_to_fresh_session(project, monkeypatch, tmp_path):
+    handoffs = Path(project.path) / "handoffs"
+    handoffs.mkdir()
+    handoff = handoffs / "2026-08-23-task-handoff.md"
+    handoff.write_text("# Handoff\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "handoff")
+    monkeypatch.setenv("FAKE_CLAUDE_HANDOFF_PATH", str(handoff))
+    monkeypatch.setenv("FAKE_CLAUDE_SESSION_ID", "old-session")
+    mgr = _make_manager(project)
+
+    first = mgr.start_job(project.name, "finish")
+    first_result = await mgr.wait_for_job(first, max_wait_seconds=10)
+    assert first_result.info.session_action == "fresh_from_handoff"
+    assert first_result.info.handoff_path == str(handoff.resolve())
+    assert mgr.get_default_session(project.name) is None
+
+    argv_dump = tmp_path / "next-argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "ok")
+    monkeypatch.setenv("FAKE_CLAUDE_SESSION_ID", "fresh-session")
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_DUMP", str(argv_dump))
+    second = mgr.start_job(project.name, "continue")
+    await mgr.wait_for_job(second, max_wait_seconds=10)
+    argv = json.loads(argv_dump.read_text())
+    assert "--resume" not in argv
+    assert str(handoff.resolve()) in argv[-1]
+    assert mgr.get_default_session(project.name) == "fresh-session"
+
+
+def test_job_size_cadence(project):
+    mgr = _make_manager(project)
+    assert mgr.start_job  # manager construction also verifies persisted state loading
+    from claude_control.orchestration import check_seconds
+
+    assert [check_seconds(size) for size in ("one_off", "small", "medium", "large")] == [
+        60,
+        300,
+        600,
+        1200,
+    ]
 
 
 @pytest.mark.anyio

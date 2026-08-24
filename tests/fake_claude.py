@@ -25,6 +25,8 @@ Modes:
                 FAKE_CLAUDE_STREAM_INTERVAL seconds for FAKE_CLAUDE_STREAM_COUNT
                 iterations, then a successful result. Used to verify that
                 liveness signals reset the idle timer.
+- no_result     emit system init and exit 0 without a terminal result.
+- handoff       emit a final Markdown link to FAKE_CLAUDE_HANDOFF_PATH.
 
 Two extra optional env vars:
 - FAKE_CLAUDE_SESSION_ID  the id reported in system/init and result.
@@ -109,6 +111,32 @@ def main() -> int:
                 "is_error": False,
                 "num_turns": 1,
                 "total_cost_usd": 0.01,
+            }
+        )
+        return 0
+
+    if MODE == "no_result":
+        return 0
+
+    if MODE == "handoff":
+        path = os.environ["FAKE_CLAUDE_HANDOFF_PATH"]
+        emit(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": f"Done.\n\n[handoff]({path})"}
+                    ]
+                },
+            }
+        )
+        emit(
+            {
+                "type": "result",
+                "session_id": SESSION_ID,
+                "is_error": False,
+                "num_turns": 1,
+                "usage": {"input_tokens": 20, "output_tokens": 5},
             }
         )
         return 0

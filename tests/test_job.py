@@ -107,6 +107,21 @@ async def test_run_records_failure_on_nonzero_exit(project, monkeypatch):
     assert job.returncode == 1
     # No system init emitted before crash, so no session_id should leak.
     assert job.session_id is None
+    assert job.is_error is True
+    assert "code 1" in (job.error_message or "")
+
+
+@pytest.mark.anyio
+async def test_zero_exit_without_terminal_event_is_protocol_failure(project, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "no_result")
+
+    job = _make_job(project)
+    await job.run()
+
+    assert job.state == JobState.FAILED
+    assert job.is_error is True
+    assert job.saw_terminal_event is False
+    assert "without a terminal result" in (job.error_message or "")
 
 
 @pytest.mark.anyio
@@ -239,6 +254,7 @@ async def test_codex_run_completes_and_records_state(project, monkeypatch):
     assert job.returncode == 0
     assert job.is_error is False
     assert job.num_turns == 1
+    assert job.token_usage == {"input_tokens": 10, "output_tokens": 2}
 
 
 @pytest.mark.anyio
