@@ -19,19 +19,27 @@ project all default to that same id; this is the caller's choice — pass
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import anyio
 
 from .agents import AgentKind, find_claude_cli, find_codex_cli, parse_agent
 from .config import ProjectConfig
 from .job import Job, JobInfo, JobState
+from .orchestration import (
+    atomic_json,
+    check_seconds,
+    codex_context_usage,
+    controlled_prompt,
+    validated_handoff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +102,15 @@ class JobManager:
 
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._finalized_events: dict[str, anyio.Event] = {}
+        self._job_sizes: dict[str, str] = {}
+        self._pending_used: dict[str, str] = {}
         self._project_default_session: dict[tuple[AgentKind, str], str] = {}
+        self._pending_handoff: dict[tuple[AgentKind, str], str] = {}
+        self._receipts: dict[str, dict[str, Any]] = {}
+        self._state_path = self.artifact_root / ".control" / "session-state.json"
+        self._load_state()
+        self._load_receipts()
 
         logger.info(
             "JobManager initialized (projects=%s)",
@@ -113,6 +129,7 @@ class JobManager:
         agent: AgentKind | str = AgentKind.CLAUDE,
         session_id: Optional[str] = None,
         use_default_session: bool = True,
+        job_size: str = "small",
     ) -> str:
         """Start a new job and return its ``job_id``. Does not block.
 
@@ -135,12 +152,15 @@ class JobManager:
             )
 
         agent_kind = parse_agent(agent)
+        check_seconds(job_size)
+        key = (agent_kind, project_name)
+        pending = self._pending_handoff.get(key) if use_default_session and session_id is None else None
 
         # Resolve resume target
         if session_id is not None:
             resume_id: Optional[str] = session_id
-        elif use_default_session:
-            resume_id = self._project_default_session.get((agent_kind, project_name))
+        elif use_default_session and pending is None:
+            resume_id = self._project_default_session.get(key)
         else:
             resume_id = None
 
@@ -148,13 +168,17 @@ class JobManager:
         job = Job(
             job_id=job_id,
             project=self.projects[project_name],
-            prompt=prompt,
+            prompt=controlled_prompt(prompt, pending),
             cli_command=self._get_cli_command(agent_kind),
             agent=agent_kind,
             resume_session_id=resume_id,
             artifact_root=self.artifact_root,
         )
         self._jobs[job_id] = job
+        self._finalized_events[job_id] = anyio.Event()
+        self._job_sizes[job_id] = job_size
+        if pending:
+            self._pending_used[job_id] = pending
 
         # Spawn the runner. We use asyncio.create_task (not anyio's
         # structured task groups) because we need fire-and-forget semantics
@@ -195,20 +219,67 @@ class JobManager:
     async def _run_job(self, job: Job) -> None:
         """Inner runner: execute the job, then update the project's default
         session on success."""
-        await job.run()
-        if (
-            job.state == JobState.COMPLETED
-            and (job.final_session_id or job.session_id)
-        ):
-            sid = job.final_session_id or job.session_id
-            assert sid is not None
-            self._project_default_session[(job.agent, job.project.name)] = sid
-            logger.info(
-                "Project '%s:%s' default session updated to %s",
-                job.agent.value,
-                job.project.name,
-                sid,
-            )
+        try:
+            await job.run()
+            self._finalize_job(job)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Job %s finalization failed", job.job_id)
+            job.state = JobState.ERROR
+            job.is_error = True
+            job.error_message = f"FinalizationError: {exc}"
+            self._write_receipt(job)
+        finally:
+            self._finalized_events[job.job_id].set()
+
+    def _finalize_job(self, job: Job) -> None:
+        key = (job.agent, job.project.name)
+        sid = job.final_session_id or job.session_id
+        if job.agent == AgentKind.CODEX:
+            context = codex_context_usage(sid)
+            if context is not None:
+                rollout_usage = context.pop("token_usage", {})
+                if isinstance(rollout_usage, dict):
+                    for name, value in rollout_usage.items():
+                        if isinstance(name, str) and isinstance(value, int):
+                            job.token_usage.setdefault(name, value)
+                job.context_usage = context
+        response_tail = "\n".join(job.text_parts)
+        try:
+            with job.artifact_path.open("rb") as artifact:
+                artifact.seek(0, os.SEEK_END)
+                artifact.seek(max(0, artifact.tell() - 64 * 1024))
+                response_tail = artifact.read().decode("utf-8", errors="replace")
+        except OSError:
+            pass
+        job.handoff_path = validated_handoff(response_tail, job.project.path)
+
+        used_pending = self._pending_used.get(job.job_id)
+        if job.state == JobState.COMPLETED:
+            if job.handoff_path:
+                job.session_action = "fresh_from_handoff"
+                self._pending_handoff[key] = job.handoff_path
+                self._project_default_session.pop(key, None)
+            else:
+                percent = (
+                    job.context_usage.get("used_percentage")
+                    if job.context_usage is not None
+                    else None
+                )
+                if isinstance(percent, (int, float)) and percent >= 60:
+                    job.session_action = "handoff_missing"
+                elif isinstance(percent, (int, float)) and percent >= 50:
+                    job.session_action = "handoff_recommended"
+                else:
+                    job.session_action = "resume"
+                if sid:
+                    self._project_default_session[key] = sid
+                if used_pending and self._pending_handoff.get(key) == used_pending:
+                    self._pending_handoff.pop(key, None)
+        else:
+            job.session_action = "retry_or_reset"
+
+        self._save_state()
+        self._write_receipt(job)
 
     def _on_task_done(self, job_id: str, task: asyncio.Task) -> None:
         # Surface unexpected task-level exceptions in the log. Job.run
@@ -229,6 +300,10 @@ class JobManager:
 
     def get_job_info(self, job_id: str) -> JobInfo:
         return self.get_job(job_id).info()
+
+    def job_check_seconds(self, job_id: str) -> int:
+        self.get_job(job_id)
+        return check_seconds(self._job_sizes.get(job_id, "small"))
 
     def list_jobs(
         self,
@@ -257,12 +332,13 @@ class JobManager:
         """
         job = self.get_job(job_id)
         if job.is_finished:
+            await self._finalized_events[job_id].wait()
             return False
         job.request_cancel()
         # Give the cancellation a moment to propagate. Don't wait forever —
         # the caller can always poll get_job_status afterwards.
         with anyio.move_on_after(10):
-            await job.wait()
+            await self._finalized_events[job_id].wait()
         return True
 
     async def wait_for_job(
@@ -291,6 +367,7 @@ class JobManager:
         """
         job = self.get_job(job_id)
         if job.is_finished:
+            await self._finalized_events[job_id].wait()
             return WaitResult(info=job.info(), wait_status="completed")
 
         # Race: completion vs wall-clock vs idle-timer. Whoever fires first
@@ -300,7 +377,7 @@ class JobManager:
         stop_event = anyio.Event()
 
         async def watch_completion() -> None:
-            await job.wait()
+            await self._finalized_events[job_id].wait()
             stop_event.set()
 
         async def watch_wall() -> None:
@@ -368,6 +445,9 @@ class JobManager:
         for job_id in to_remove:
             self._jobs.pop(job_id, None)
             self._tasks.pop(job_id, None)
+            self._finalized_events.pop(job_id, None)
+            self._job_sizes.pop(job_id, None)
+            self._pending_used.pop(job_id, None)
         if to_remove:
             logger.info(
                 "Cleaned up %d finished job(s) older than %.0fs",
@@ -398,6 +478,8 @@ class JobManager:
             return False
         agent_kind = parse_agent(agent)
         sid = self._project_default_session.pop((agent_kind, project_name), None)
+        self._pending_handoff.pop((agent_kind, project_name), None)
+        self._save_state()
         if sid is not None:
             logger.info(
                 "Reset default session for '%s:%s' (was %s)",
@@ -422,7 +504,7 @@ class JobManager:
             job.request_cancel()
         with anyio.move_on_after(grace_seconds):
             for job in running:
-                await job.wait()
+                await self._finalized_events[job.job_id].wait()
         # If any tasks are still pending, cancel them at the asyncio level too
         for job_id, task in self._tasks.items():
             if not task.done():
@@ -443,6 +525,7 @@ class JobManager:
         session_id: Optional[str] = None,
         use_default_session: bool = True,
         cancel_on_timeout: bool = False,
+        job_size: str = "small",
     ) -> WaitResult:
         """Start a job and wait for it. Convenience over start_job + wait_for_job.
 
@@ -456,6 +539,7 @@ class JobManager:
             agent=agent,
             session_id=session_id,
             use_default_session=use_default_session,
+            job_size=job_size,
         )
         result = await self.wait_for_job(
             job_id,
@@ -467,3 +551,156 @@ class JobManager:
             # Re-fetch the post-cancel snapshot.
             result = WaitResult(info=self.get_job_info(job_id), wait_status=result.wait_status)
         return result
+
+    # ------------------------------------------------------------------
+    # Durable receipts and session rotation state
+    # ------------------------------------------------------------------
+
+    def _receipt(self, job: Job) -> dict[str, Any]:
+        info = job.info()
+        error_category: Optional[str] = None
+        if info.state == JobState.CANCELLED:
+            error_category = "cancelled"
+        elif info.state == JobState.ERROR:
+            error_category = "control_error"
+        elif info.state == JobState.FAILED:
+            error_category = (
+                "agent_error" if info.saw_terminal_event else "protocol_error"
+            )
+            if info.returncode not in (None, 0):
+                error_category = "process_exit"
+        total = sum(
+            value
+            for key, value in info.token_usage.items()
+            if key in {"input_tokens", "output_tokens"}
+        )
+        return {
+            "job_id": info.job_id,
+            "project": info.project,
+            "agent": info.agent.value,
+            "state": info.state.value,
+            "started_at": info.started_at,
+            "finished_at": info.finished_at,
+            "returncode": info.returncode,
+            "is_error": info.is_error,
+            "error_category": error_category,
+            "error_message": info.error_message,
+            "stderr_tail": info.stderr_tail if info.is_error else "",
+            "session_id": info.session_id,
+            "resume_session_id": info.resume_session_id,
+            "token_usage": {
+                **info.token_usage,
+                "total_tokens": info.token_usage.get("total_tokens", total),
+            },
+            "model_usage": info.model_usage,
+            "cost_usd": info.cost_usd,
+            "context_usage": info.context_usage,
+            "session_action": info.session_action,
+            "handoff_path": info.handoff_path,
+            "artifact_path": info.artifact_path,
+            "artifact_char_count": info.artifact_char_count,
+            "result_path": info.result_path,
+            "delivered_at": None,
+        }
+
+    def _write_receipt(self, job: Job) -> None:
+        path = job.artifact_path.parent / "result.json"
+        job.result_path = str(path)
+        receipt = self._receipt(job)
+        receipt["result_path"] = str(path)
+        atomic_json(path, receipt)
+        self._receipts[job.job_id] = receipt
+
+    def drain_completion_inbox(
+        self,
+        project_name: Optional[str] = None,
+        agent: Optional[AgentKind | str] = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        agent_kind = parse_agent(agent) if agent is not None else None
+        completed: list[dict[str, Any]] = []
+        now = time.time()
+        for receipt in self._receipts.values():
+            if receipt.get("delivered_at") is not None:
+                continue
+            if project_name and receipt.get("project") != project_name:
+                continue
+            if agent_kind and receipt.get("agent") != agent_kind.value:
+                continue
+            receipt["delivered_at"] = now
+            result_path = receipt.get("result_path")
+            if isinstance(result_path, str):
+                atomic_json(Path(result_path), receipt)
+            completed.append(dict(receipt))
+        active = [
+            {
+                "job_id": info.job_id,
+                "project": info.project,
+                "agent": info.agent.value,
+                "state": info.state.value,
+                "next_check_seconds": self.job_check_seconds(info.job_id),
+            }
+            for info in self.list_jobs(project_name=project_name, agent=agent_kind)
+            if not info.is_finished
+        ]
+        return completed, active
+
+    def acknowledge_receipt(self, job_id: str) -> None:
+        receipt = self._receipts.get(job_id)
+        if receipt is None or receipt.get("delivered_at") is not None:
+            return
+        receipt["delivered_at"] = time.time()
+        result_path = receipt.get("result_path")
+        if isinstance(result_path, str):
+            atomic_json(Path(result_path), receipt)
+
+    def _save_state(self) -> None:
+        atomic_json(
+            self._state_path,
+            {
+                "default_sessions": [
+                    {"agent": agent.value, "project": project, "session_id": sid}
+                    for (agent, project), sid in self._project_default_session.items()
+                ],
+                "pending_handoffs": [
+                    {"agent": agent.value, "project": project, "handoff_path": path}
+                    for (agent, project), path in self._pending_handoff.items()
+                ],
+            },
+        )
+
+    def _load_state(self) -> None:
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+        for item in data.get("default_sessions", []):
+            try:
+                key = (parse_agent(item["agent"]), str(item["project"]))
+                if key[1] in self.projects:
+                    self._project_default_session[key] = str(item["session_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        for item in data.get("pending_handoffs", []):
+            try:
+                key = (parse_agent(item["agent"]), str(item["project"]))
+                path = validated_handoff(
+                    f"[handoff]({item['handoff_path']})",
+                    self.projects[key[1]].path,
+                )
+                if path:
+                    self._pending_handoff[key] = path
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def _load_receipts(self) -> None:
+        if not self.artifact_root.is_dir():
+            return
+        for path in self.artifact_root.glob("*/*/*/result.json"):
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+                job_id = receipt.get("job_id")
+                if isinstance(job_id, str):
+                    receipt["result_path"] = str(path)
+                    self._receipts[job_id] = receipt
+            except (OSError, json.JSONDecodeError):
+                continue

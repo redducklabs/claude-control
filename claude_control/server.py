@@ -73,6 +73,18 @@ def _tail_text(text: str, text_limit: int) -> str:
     return text[-limit:]
 
 
+def _error_category(info: JobInfo) -> Optional[str]:
+    if info.state.value == "cancelled":
+        return "cancelled"
+    if info.state.value == "error":
+        return "control_error"
+    if info.state.value != "failed":
+        return None
+    if info.returncode not in (None, 0):
+        return "process_exit"
+    return "agent_error" if info.saw_terminal_event else "protocol_error"
+
+
 def _info_dict(
     info: JobInfo,
     *,
@@ -109,6 +121,23 @@ def _info_dict(
         "error_message": info.error_message,
         "cancelled": info.cancelled,
         "prompt_chars": info.prompt_chars,
+        "saw_terminal_event": info.saw_terminal_event,
+        "token_usage": {
+            **info.token_usage,
+            "total_tokens": info.token_usage.get(
+                "total_tokens",
+                sum(
+                    info.token_usage.get(key, 0)
+                    for key in ("input_tokens", "output_tokens")
+                ),
+            ),
+        },
+        "model_usage": info.model_usage,
+        "context_usage": info.context_usage,
+        "handoff_path": info.handoff_path,
+        "session_action": info.session_action,
+        "result_path": info.result_path,
+        "error_category": _error_category(info),
     }
     if include_text:
         out["text_so_far"] = _tail_text(info.text_so_far, text_limit)
@@ -148,14 +177,14 @@ async def start_job(
     agent: str = "claude",
     session_id: Optional[str] = None,
     use_default_session: bool = True,
+    job_size: str = "small",
 ) -> Dict[str, Any]:
     """Start a Claude Code or Codex job in the named project. Returns immediately.
 
-    The job runs in the background as long as the MCP server is alive,
-    independent of any waiter. Use ``get_job_status`` to poll, ``wait_for_job``
-    to block until done, and ``cancel_job`` to kill it explicitly. Per-call
-    wait timeouts in ``wait_for_job`` do NOT kill the job — the subprocess
-    keeps running and remains accessible.
+    The job runs in the background as long as the MCP server is alive. The
+    controller MUST schedule the timer returned by this call and invoke
+    ``drain_completion_inbox`` until the job is terminal. Per-call wait
+    timeouts do not kill the subprocess.
 
     Args:
         project: Name of the project (as defined in projects.json).
@@ -167,6 +196,8 @@ async def start_job(
             the most recent successful job in this project. Pass False to
             start a fresh conversation (e.g., for parallel jobs that
             shouldn't share context).
+        job_size: Timer cadence: ``one_off``=60s, ``small``=300s,
+            ``medium``=600s, or ``large``=1200s.
 
     Returns:
         ``{"job_id": "<uuid>"}`` on success.
@@ -179,8 +210,19 @@ async def start_job(
             agent=agent,
             session_id=session_id,
             use_default_session=use_default_session,
+            job_size=job_size,
         )
-        return {"job_id": job_id}
+        interval = mgr.job_check_seconds(job_id)
+        return {
+            "job_id": job_id,
+            "job_size": job_size,
+            "next_check_seconds": interval,
+            "required_next_tool": "drain_completion_inbox",
+            "controller_instruction": (
+                f"Set a timer for {interval} seconds, then call "
+                "drain_completion_inbox. Repeat while this job remains active."
+            ),
+        }
     except Exception as e:  # noqa: BLE001
         logger.exception("start_job failed for project '%s'", project)
         return {"is_error": True, "error_message": str(e)}
@@ -296,6 +338,8 @@ async def wait_for_job(
             max_wait_seconds=max_wait_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
         )
+        if result.wait_status == "completed":
+            mgr.acknowledge_receipt(job_id)
         return _wait_dict(
             result,
             include_text=include_text,
@@ -382,6 +426,31 @@ async def list_jobs(
 
 
 @mcp.tool()
+async def drain_completion_inbox(
+    project: Optional[str] = None,
+    agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return unread durable receipts and active jobs, then acknowledge receipts.
+
+    A controller with active jobs MUST schedule each returned
+    ``next_check_seconds`` timer and call this tool again.
+    """
+    mgr = _get_manager()
+    try:
+        completed, active = mgr.drain_completion_inbox(project, agent)
+        return {
+            "completed": completed,
+            "active": active,
+            "controller_instruction": (
+                "Handle every completed receipt. If jobs remain active, set their "
+                "shown timers and call drain_completion_inbox again."
+            ),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"is_error": True, "error_message": str(e)}
+
+
+@mcp.tool()
 async def cleanup_finished_jobs(
     older_than_seconds: float = 3600.0,
 ) -> Dict[str, Any]:
@@ -414,6 +483,7 @@ async def send_command(
     include_text: bool = True,
     text_limit: int = DEFAULT_TEXT_LIMIT,
     include_stderr: bool = False,
+    job_size: str = "small",
 ) -> Dict[str, Any]:
     """Synchronous send: start a job and wait for it. One call.
 
@@ -434,6 +504,8 @@ async def send_command(
             from the project's most-recent-successful session.
         cancel_on_timeout: If True and the wait times out, also cancel
             the underlying job (kills the subprocess).
+        job_size: Completion-check cadence metadata: ``one_off``, ``small``,
+            ``medium``, or ``large``.
     """
     mgr = _get_manager()
     try:
@@ -446,7 +518,10 @@ async def send_command(
             session_id=session_id,
             use_default_session=use_default_session,
             cancel_on_timeout=cancel_on_timeout,
+            job_size=job_size,
         )
+        if result.wait_status == "completed":
+            mgr.acknowledge_receipt(result.info.job_id)
         return _wait_dict(
             result,
             include_text=include_text,

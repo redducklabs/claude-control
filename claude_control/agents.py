@@ -27,6 +27,8 @@ class ParsedLine:
     error_message: Optional[str] = None
     num_turns: Optional[int] = None
     cost_usd: Optional[float] = None
+    token_usage: dict[str, int] | None = None
+    model_usage: dict[str, Any] | None = None
     saw_result: bool = False
 
 
@@ -95,6 +97,12 @@ class ClaudeRunner(AgentRunner):
             parsed.is_error = bool(msg.get("is_error", False))
             parsed.num_turns = msg.get("num_turns", 0) or 0
             parsed.cost_usd = msg.get("total_cost_usd")
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                parsed.token_usage = _integer_usage(usage)
+            model_usage = msg.get("modelUsage") or msg.get("model_usage")
+            if isinstance(model_usage, dict):
+                parsed.model_usage = model_usage
         return parsed
 
 
@@ -150,6 +158,7 @@ class CodexRunner(AgentRunner):
             usage = msg.get("usage")
             if isinstance(usage, dict):
                 parsed.num_turns = 1
+                parsed.token_usage = _integer_usage(usage)
         elif msg_type == "turn.failed":
             parsed.saw_result = True
             parsed.is_error = True
@@ -160,6 +169,15 @@ class CodexRunner(AgentRunner):
             parsed.error_message = _codex_error_message(msg)
 
         return parsed
+
+
+def _integer_usage(value: dict[str, Any]) -> dict[str, int]:
+    """Keep only numeric token counters from an untrusted CLI event."""
+    return {
+        str(key): int(item)
+        for key, item in value.items()
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+    }
 
 
 def _codex_error_message(msg: dict[str, Any]) -> str:

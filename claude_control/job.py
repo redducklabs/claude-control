@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from subprocess import DEVNULL, PIPE
@@ -101,6 +101,13 @@ class JobInfo:
     cancelled: bool
     prompt_chars: int
     resume_session_id: Optional[str]
+    saw_terminal_event: bool = False
+    token_usage: dict[str, int] = field(default_factory=dict)
+    model_usage: dict[str, object] = field(default_factory=dict)
+    context_usage: Optional[dict[str, object]] = None
+    handoff_path: Optional[str] = None
+    session_action: str = "resume"
+    result_path: Optional[str] = None
 
     @property
     def is_finished(self) -> bool:
@@ -159,6 +166,13 @@ class Job:
         self.cost_usd: Optional[float] = None
         self.returncode: Optional[int] = None
         self.error_message: Optional[str] = None
+        self.saw_terminal_event = False
+        self.token_usage: dict[str, int] = {}
+        self.model_usage: dict[str, object] = {}
+        self.context_usage: Optional[dict[str, object]] = None
+        self.handoff_path: Optional[str] = None
+        self.session_action = "resume"
+        self.result_path: Optional[str] = None
         root = Path(artifact_root) if artifact_root is not None else DEFAULT_ARTIFACT_ROOT
         self.artifact_path = self._build_artifact_path(root)
         self.artifact_char_count = 0
@@ -215,6 +229,13 @@ class Job:
             cancelled=self.cancel_requested,
             prompt_chars=len(self.prompt),
             resume_session_id=self.resume_session_id,
+            saw_terminal_event=self.saw_terminal_event,
+            token_usage=dict(self.token_usage),
+            model_usage=dict(self.model_usage),
+            context_usage=dict(self.context_usage) if self.context_usage else None,
+            handoff_path=self.handoff_path,
+            session_action=self.session_action,
+            result_path=self.result_path,
         )
 
     async def wait(self) -> None:
@@ -305,10 +326,20 @@ class Job:
             if self.state == JobState.RUNNING:
                 if self.cancel_requested:
                     self.state = JobState.CANCELLED
-                elif self.returncode != 0 or self.is_error:
+                elif self.returncode != 0 or self.is_error or not self.saw_terminal_event:
                     self.state = JobState.FAILED
                 else:
                     self.state = JobState.COMPLETED
+
+            if self.state in {JobState.FAILED, JobState.ERROR}:
+                self.is_error = True
+                if not self.error_message:
+                    if self.returncode not in (None, 0):
+                        self.error_message = f"Agent process exited with code {self.returncode}."
+                    elif not self.saw_terminal_event:
+                        self.error_message = "Agent process exited without a terminal result event."
+                    else:
+                        self.error_message = "Agent job failed."
 
             self._completion_event.set()
             logger.info(
@@ -415,6 +446,7 @@ class Job:
                     self.text_parts.append(text)
                     self._text_chars += len(text)
         if parsed.saw_result:
+            self.saw_terminal_event = True
             self.final_session_id = parsed.final_session_id
             if self.final_session_id is None and self.agent == AgentKind.CODEX:
                 self.final_session_id = self.session_id
@@ -424,6 +456,10 @@ class Job:
                 self.num_turns = parsed.num_turns
             if parsed.cost_usd is not None:
                 self.cost_usd = parsed.cost_usd
+            if parsed.token_usage is not None:
+                self.token_usage.update(parsed.token_usage)
+            if parsed.model_usage is not None:
+                self.model_usage.update(parsed.model_usage)
             if parsed.error_message:
                 self.error_message = parsed.error_message
         # Other types (user, system non-init, stream_event, rate_limit_event)

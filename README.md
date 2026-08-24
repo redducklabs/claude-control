@@ -6,7 +6,7 @@ MCP server that lets a Claude Code session coordinate with Claude Code or Codex 
 
 Claude Control is an MCP server (stdio transport) that exposes tools for dispatching prompts to Claude Code or Codex instances in configured project directories. Each remote instance:
 
-- Runs as a persistent subprocess with conversation context preserved across calls
+- Preserves conversation context across short-lived CLI invocations by resuming sessions
 - Loads the target project's own context files and settings
 - Runs fully autonomously by default
 
@@ -134,6 +134,18 @@ To reduce token usage, status/list tools omit assistant text unless `include_tex
 
 Each job also writes assistant text to a local artifact file and returns `artifact_path`, `artifact_char_count`, and `artifact_available`. By default artifacts are stored under `~/.cache/claude-control/artifacts`; override this with `CLAUDE_CONTROL_ARTIFACT_DIR`.
 
+Terminal responses also include available token usage, model usage, retained-context telemetry, a `session_action`, and any validated handoff path. Values that the selected CLI does not expose are left absent or `null`, rather than estimated.
+
+### Background jobs and completion inbox
+
+`start_job` accepts a `job_size` of `one_off`, `small` (default), `medium`, or `large`. Its response tells the controlling agent to set a timer for 60, 300, 600, or 1200 seconds respectively and then call `drain_completion_inbox`.
+
+`drain_completion_inbox` returns compact unread completion/error receipts and the jobs still active. Receipts are stored as `result.json` beside each response artifact and survive MCP server restarts. Calling the tool acknowledges the receipts it returns.
+
+Every child prompt receives a short control footer requiring the child to follow its project's context-health and handoff policy. When the final response ends with a Markdown link to a real file inside the project's `handoffs` directory, Claude Control clears the old default session. The next default job starts fresh and is directed to continue from that handoff.
+
+Codex retained-context percentage is read from the matching local rollout when available. At 50% the receipt recommends a handoff; at 60% it requires one. Claude CLI usage is reported, but no retained-context percentage is inferred when Claude does not expose one.
+
 ### `read_job_artifact`
 
 Read a bounded slice of a job's assistant-text artifact.
@@ -152,7 +164,7 @@ List all configured projects with their paths, descriptions, and session status.
 
 ### `reset_session`
 
-Tear down a project's Claude Code session. The next `send_command` call creates a fresh session with no prior context.
+Clear a project's remembered session and pending handoff. The next default call creates a fresh session with no prior context.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
