@@ -85,6 +85,41 @@ def _error_category(info: JobInfo) -> Optional[str]:
     return "agent_error" if info.saw_terminal_event else "protocol_error"
 
 
+# Thresholds for the derived `health` verdict, in seconds since the last
+# SUBSTANTIVE event. These exist so the caller does not have to re-derive the
+# "is it stuck?" judgement by eye across two polls — the judgement that, done
+# manually, has repeatedly either missed a dead child or falsely accused a
+# working one.
+HEALTH_SLOW_SECONDS = 15 * 60
+HEALTH_STALLED_SECONDS = 45 * 60
+
+
+def _health(info: JobInfo) -> str:
+    """One-word verdict on a job's progress.
+
+    ``finished``  — terminal state; nothing to judge.
+    ``starting``  — running, but no substantive event has arrived yet.
+    ``working``   — progressed recently.
+    ``slow``      — no progress for a while; usually a long tool call.
+    ``stalled``   — no progress for long enough to warrant investigating.
+
+    🔴 ``stalled`` is a PROMPT TO LOOK, not a diagnosis. A genuinely long
+    test suite and a wedged subprocess both look like this; ``last_tool_name``
+    and ``last_tool_running_for_seconds`` are what tell them apart.
+    """
+    if info.is_finished:
+        return "finished"
+    if info.stalled_for_seconds is None:
+        return "starting"
+    if info.last_progress_at is None:
+        return "starting"
+    if info.stalled_for_seconds >= HEALTH_STALLED_SECONDS:
+        return "stalled"
+    if info.stalled_for_seconds >= HEALTH_SLOW_SECONDS:
+        return "slow"
+    return "working"
+
+
 def _info_dict(
     info: JobInfo,
     *,
@@ -138,6 +173,16 @@ def _info_dict(
         "session_action": info.session_action,
         "result_path": info.result_path,
         "error_category": _error_category(info),
+        # Progress vs. liveness. `last_activity_at` moves on ANY stream line,
+        # so it cannot distinguish a working child from one blocked inside a
+        # single tool call. These can.
+        "last_progress_at": info.last_progress_at,
+        "stalled_for_seconds": info.stalled_for_seconds,
+        "health": _health(info),
+        "last_tool_name": info.last_tool_name,
+        "last_tool_at": info.last_tool_at,
+        "last_tool_running_for_seconds": info.last_tool_running_for_seconds,
+        "recent_tools": info.recent_tools,
     }
     if include_text:
         out["text_so_far"] = _tail_text(info.text_so_far, text_limit)

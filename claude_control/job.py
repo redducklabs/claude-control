@@ -54,6 +54,10 @@ DEFAULT_ARTIFACT_ROOT = Path(
     )
 )
 
+# How many recent tool names to retain for monitoring. Enough to see the
+# shape of what a child is doing without turning status into a transcript.
+RECENT_TOOLS_CAP = 12
+
 # Grace period for the subprocess to exit after terminate() before we kill().
 TERMINATE_GRACE_SECONDS = 5
 
@@ -108,6 +112,26 @@ class JobInfo:
     handoff_path: Optional[str] = None
     session_action: str = "resume"
     result_path: Optional[str] = None
+    #: When the job last did something SUBSTANTIVE — assistant text or a tool
+    #: call — as opposed to ``last_activity_at``, which ANY stream line resets,
+    #: including pure liveness pings. A child blocked on a wedged subprocess
+    #: keeps ``last_activity_at`` advancing and therefore looks healthy; this
+    #: field is what distinguishes "slow" from "stuck".
+    last_progress_at: Optional[float] = None
+    #: Seconds since the last substantive event; ``None`` once finished. This
+    #: is the number to threshold on. It replaces the manual heuristic of
+    #: comparing ``last_activity_at`` by eye across two polls.
+    stalled_for_seconds: Optional[float] = None
+    #: The most recent tool call and when it started. One tool running for a
+    #: very long time is the shape of a wedged child (e.g. a review CLI
+    #: blocking on an open stdin), and is invisible without this.
+    last_tool_name: Optional[str] = None
+    last_tool_at: Optional[float] = None
+    #: Seconds the most recent tool call has been outstanding, if no newer
+    #: event has arrived since it started; ``None`` otherwise.
+    last_tool_running_for_seconds: Optional[float] = None
+    #: Most recent tool names, oldest first, capped at ``RECENT_TOOLS_CAP``.
+    recent_tools: list[str] = field(default_factory=list)
 
     @property
     def is_finished(self) -> bool:
@@ -180,6 +204,10 @@ class Job:
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
         self.last_activity_at: Optional[float] = None
+        self.last_progress_at: Optional[float] = None
+        self.last_tool_name: Optional[str] = None
+        self.last_tool_at: Optional[float] = None
+        self.recent_tools: list[str] = []
 
         # Cancellation
         self.cancel_requested: bool = False
@@ -208,6 +236,19 @@ class Job:
 
     def info(self) -> JobInfo:
         stderr_text = b"".join(self._stderr_chunks).decode("utf-8", errors="replace")
+        # Derived only while the job is live. A finished job has not "stalled";
+        # reporting a growing number for it would be actively misleading.
+        stalled_for: Optional[float] = None
+        tool_running_for: Optional[float] = None
+        if self.state is JobState.RUNNING:
+            now = time.time()
+            reference = self.last_progress_at or self.started_at
+            if reference is not None:
+                stalled_for = max(0.0, now - reference)
+            # Only meaningful when nothing newer has arrived since the tool
+            # call; otherwise the tool has already returned.
+            if self.last_tool_at is not None and self.last_tool_at == self.last_progress_at:
+                tool_running_for = max(0.0, now - self.last_tool_at)
         return JobInfo(
             job_id=self.job_id,
             project=self.project.name,
@@ -236,6 +277,12 @@ class Job:
             handoff_path=self.handoff_path,
             session_action=self.session_action,
             result_path=self.result_path,
+            last_progress_at=self.last_progress_at,
+            stalled_for_seconds=stalled_for,
+            last_tool_name=self.last_tool_name,
+            last_tool_at=self.last_tool_at,
+            last_tool_running_for_seconds=tool_running_for,
+            recent_tools=list(self.recent_tools),
         )
 
     async def wait(self) -> None:
@@ -439,6 +486,25 @@ class Job:
         if sid and self.session_id is None:
             self.session_id = sid
 
+        # Progress vs. mere liveness. Only a real assistant turn counts; a
+        # stream ping does not. This is the whole point of the distinction —
+        # a child blocked inside one long tool call still emits pings.
+        if parsed.is_progress:
+            self.last_progress_at = self.last_activity_at
+            # Count turns as they happen. Waiting for the terminal ``result``
+            # meant a RUNNING job always reported num_turns=0, which hid the
+            # falling-turn-count signal that indicates a saturated session.
+            if not parsed.saw_result:
+                self.num_turns += 1
+
+        if parsed.tool_names:
+            for name in parsed.tool_names:
+                self.recent_tools.append(name)
+            if len(self.recent_tools) > RECENT_TOOLS_CAP:
+                del self.recent_tools[:-RECENT_TOOLS_CAP]
+            self.last_tool_name = self.recent_tools[-1]
+            self.last_tool_at = self.last_activity_at
+
         if parsed.text_parts:
             for text in parsed.text_parts:
                 self._append_artifact_text(text)
@@ -453,7 +519,11 @@ class Job:
             if parsed.is_error is not None:
                 self.is_error = parsed.is_error
             if parsed.num_turns is not None:
-                self.num_turns = parsed.num_turns
+                # Take the larger of the two. The agent's own terminal count is
+                # authoritative where it reports a real total (Claude), but
+                # Codex reports ``1`` per completed turn, which would otherwise
+                # clobber the running tally accumulated above.
+                self.num_turns = max(self.num_turns, parsed.num_turns)
             if parsed.cost_usd is not None:
                 self.cost_usd = parsed.cost_usd
             if parsed.token_usage is not None:

@@ -30,6 +30,16 @@ class ParsedLine:
     token_usage: dict[str, int] | None = None
     model_usage: dict[str, Any] | None = None
     saw_result: bool = False
+    #: Names of ``tool_use`` blocks on this line, in order.
+    #:
+    #: These are the single most useful liveness signal a caller has: a child
+    #: can run tools for many minutes while emitting no assistant TEXT at all,
+    #: which is indistinguishable from a stall unless tool activity is
+    #: surfaced. Previously these blocks were parsed and silently discarded.
+    tool_names: list[str] | None = None
+    #: True when this line represents a real assistant turn (text or tool
+    #: use), as opposed to a pure liveness ping. Drives ``last_progress_at``.
+    is_progress: bool = False
 
 
 class AgentRunner(ABC):
@@ -84,13 +94,33 @@ class ClaudeRunner(AgentRunner):
             content = msg.get("message", {}).get("content", [])
             if isinstance(content, list):
                 parts: list[str] = []
+                tools: list[str] = []
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text":
                         text = block.get("text", "")
                         if text:
                             parts.append(text)
+                    elif block_type == "tool_use":
+                        # A turn that is ALL tool calls carries no text. Those
+                        # turns are exactly the long ones (test suites, reviews),
+                        # so dropping them is what made a working child look
+                        # identical to a stalled one.
+                        name = block.get("name")
+                        if isinstance(name, str) and name:
+                            tools.append(name)
                 if parts:
                     parsed.text_parts = parts
+                if tools:
+                    parsed.tool_names = tools
+            # An assistant message IS a turn, whatever it contains. Counting it
+            # here rather than only on the terminal ``result`` is what makes the
+            # turn count observable WHILE the job runs; a falling turn count
+            # across resumes is the documented signal that a session is
+            # saturated and should be restarted fresh.
+            parsed.is_progress = True
         elif msg_type == "result":
             parsed.saw_result = True
             parsed.final_session_id = msg.get("session_id")
@@ -148,10 +178,20 @@ class CodexRunner(AgentRunner):
                 parsed.session_id = thread_id
         elif msg_type == "item.completed":
             item = msg.get("item", {})
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                text = item.get("text")
-                if text:
-                    parsed.text_parts = [text]
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "agent_message":
+                    text = item.get("text")
+                    if text:
+                        parsed.text_parts = [text]
+                    parsed.is_progress = True
+                elif item_type is not None:
+                    # Codex reports command/tool items under their own types.
+                    # Treat any completed item as progress and label it, for the
+                    # same reason as the Claude branch: a long tool-only stretch
+                    # must not read as a stall.
+                    parsed.tool_names = [str(item_type)]
+                    parsed.is_progress = True
         elif msg_type == "turn.completed":
             parsed.saw_result = True
             parsed.is_error = False
