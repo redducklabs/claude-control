@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: redducklabs-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +45,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: redducklabs-runners
+    runs-on: ubuntu-latest
     environment:
       name: ${{ github.event.inputs.environment || 'pypi' }}
       url: ${{ github.event.inputs.environment == 'testpypi' && 'https://test.pypi.org/p/claude-control' || 'https://pypi.org/p/claude-control' }}
