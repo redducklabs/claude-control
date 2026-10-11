@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version","policy_hash","findings","excluded_path_assessments"],
+  "properties": {
+    "schema_version": { "const": 8 },
+    "policy_hash":    { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "findings": {
+      "type": "array", "maxItems": 512,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path","severity","summary"],
+        "properties": {
+          "path":     { "type": "string", "maxLength": 4096 },
+          "line":     { "type": "integer", "minimum": 1, "maximum": 10000000 },
+          "severity": { "enum": ["blocking","major","minor","note"] },
+          "summary":  { "type": "string", "maxLength": 4096 },
+          "detail":   { "type": "string", "maxLength": 65536 }
+        }
+      }
+    },
+    "excluded_path_assessments": {
+      "type": "array", "maxItems": 4096,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path","verdict"],
+        "properties": {
+          "path":    { "type": "string", "maxLength": 4096 },
+          "verdict": { "enum": ["defect","examined_no_defect","not_assessable"] },
+          "reason":  { "type": "string", "maxLength": 4096 }
+        }
+      }
+    }
+  }
+}

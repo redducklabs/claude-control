@@ -188,6 +188,72 @@ Check whether a project has an active session, its ID, and turn count.
 - Claude Code CLI installed and on PATH
 - Codex CLI installed, authenticated, and on PATH if using `agent="codex"`
 
+## Software Versions
+
+Development-tool metadata checked on 2026-10-11 against the official
+[PyPI JSON API](https://docs.pypi.org/api/json/). Context7 documentation lookup
+returned a monthly-quota error; the official documentation below was used instead.
+The package's Python compatibility floor remains 3.11. The reproduced legacy test
+profile uses CPython 3.13.4, AnyIO 4.9.0, MCP 1.12.0, Pydantic 2.9.2, pytest 9.1.1
+and Trio 0.34.0; compiled development tools use CPython 3.14.7. MCP 1.12.0 with
+Pydantic 2.14.1 failed to import the legacy FastMCP API. These are verification
+environments, not qualified verifier profiles. Existing runtime dependency ranges and
+workflows were not upgraded.
+
+| Development tool | Researched stable version | Test extra range | Documentation |
+|---|---|---|---|
+| pytest | 9.1.1 | `>=9.1.1,<10` | [pytest](https://docs.pytest.org/en/stable/) |
+| Trio | 0.34.0 | `>=0.34.0,<0.35` | [AnyIO backend testing](https://anyio.readthedocs.io/en/stable/testing.html) |
+| Black | 26.10.1 | `>=26.10.1,<27` | [Black configuration](https://black.readthedocs.io/en/stable/usage_and_configuration/the_basics.html) |
+| Ruff | 0.17.0 | `>=0.17.0,<0.18` | [Ruff configuration](https://docs.astral.sh/ruff/configuration/) |
+| mypy | 2.4.0 | `>=2.4.0,<3` | [mypy command line](https://mypy.readthedocs.io/en/stable/command_line.html) |
+| coverage.py | 7.16.2 | `>=7.16.2,<8` | [Coverage source selection](https://coverage.readthedocs.io/en/latest/source.html) |
+| build | 1.6.1 | `>=1.6.1,<2` | [PyPA build](https://build.pypa.io/en/stable/) |
+
+Trio is a development dependency because the existing AnyIO test suite exercises
+both asyncio and Trio. It does not add a production backend. All introduced tools
+support the existing Python floor. Runtime MCP 2.x changes the legacy FastMCP API;
+this unit's legacy verification uses MCP 1.12.0 and makes no MCP 2.x compatibility
+claim.
+
+For the CPython 3.13 legacy suite, install its verified compatibility tuple with
+`python -m pip install '.[test]' 'anyio==4.9.0' 'mcp==1.12.0' 'pydantic==2.9.2'`.
+The explicit MCP and Pydantic pins keep this suite on the existing legacy FastMCP API;
+a fresh unconstrained test-extra install may resolve MCP 2.x. Run the full test suite
+and coverage with `python -m coverage run -m pytest`, followed by
+`python -m coverage report`. Coverage includes every `claude_control` production
+module. Run `python -m ruff check claude_control tests`,
+`python -m mypy --strict claude_control/isolated`, and
+`python -m black --check claude_control/isolated tests/test_isolated_contracts.py`.
+Strict typing applies to the new isolated package. Ruff's initial rules are
+`E9,F63,F7,F82`; this unit does not reformat legacy code. Build installable resources
+with `python -m build`.
+
+## Isolated verifier contract status
+
+`claude_control.isolated.contracts` publishes frozen request, observation,
+manifest/diff, receipt and fixed-stage types, the normative limit bundle, and
+the verbatim revision-21 result schema. Nested collections are owned and immutable.
+The bundle pins the specification, approved assurance amendment, result schema,
+exclusion inventory version 8, observer algorithm version 5 and result schema
+version 8. Its selected kernel-log exception applies only to A.1; store and output
+limits remain mandatory.
+
+`load_contract(path)` loads the packaged `resources/contracts.json` with closed
+validation and pinned resource digests. `stage_policy(name)` returns one of the six
+fixed policies. Holder wall bounds are the published lifecycle spans rather than
+invented numeric sums; execution stages retain their fixed numeric deadlines.
+`MaterializedInput.digest` binds both the manifest and canonical diff identities.
+These contracts do not perform materialization or result validation.
+
+There is no qualified isolated runtime in this unit. Calling
+`require_initial_readiness(...)` always raises the typed `Refusal` with code
+`profile unqualified`, including when a caller supplies a digest. No containers,
+provider requests, host provisioning or legacy fallback are activated. Historical
+Claude CLI 2.1.233 capture evidence does not qualify a current binary, image,
+Docker topology or host. Selecting or changing those identities requires the later
+qualification work; this unit selects none.
+
 ## Configuration
 
 The `CLAUDE_CONTROL_PROJECTS` environment variable points to your `projects.json`. If unset, defaults to `projects.json` in the package's parent directory.

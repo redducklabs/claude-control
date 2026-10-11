@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "spec_digest": "sha256:85150e0523ea515d500968a1d277e4327ecc2b96ba9d8dafa2c4627ae5631e19",
+  "amendment_digest": "sha256:86c5c08e3da4283bbf037a7835b8b9b0091b3135f3588f05c66d2137884999b8",
+  "schema_digest": "sha256:f4d1a1becb0931766fdf9bf0212ff4d1fb0963aff47d6060ed992e2b0326ab27",
+  "exclusion_inventory_version": 8,
+  "observer_algorithm_version": 5,
+  "result_schema_version": 8,
+  "kernel_log_exception": "a1-only-unbounded-host-kernel-logs",
+  "limits": {
+    "stores": {
+      "quarantine_bytes": 4294967296,
+      "quarantine_inodes": 65536,
+      "input_bytes": 2147483648,
+      "input_inodes": 204096,
+      "reservation_bytes": 6442450944,
+      "aggregate_bytes": 12884901888,
+      "concurrent_jobs": 4
+    },
+    "shape": {
+      "paths": 200000,
+      "depth": 64,
+      "tree_entries": 20000,
+      "file_bytes": 67108864,
+      "expanded_bytes": 2147483648,
+      "delta_depth": 50,
+      "excluded_paths": 4096
+    },
+    "result": {
+      "stream_bytes": 7340032,
+      "event_bytes": 1048576,
+      "events": 10000,
+      "depth": 32,
+      "keys": 256,
+      "array_elements": 4096,
+      "string_bytes": 262144,
+      "stderr_tail_bytes": 1048576
+    },
+    "broker": {
+      "requests": 200,
+      "tokens": 2000000,
+      "request_bytes": 33554432,
+      "response_bytes": 33554432,
+      "aggregate_request_bytes": 268435456,
+      "aggregate_response_bytes": 268435456,
+      "request_seconds": 600,
+      "log_bytes": 16777216,
+      "components": 4096,
+      "component_bytes": 67108864,
+      "decomposition_cpu_seconds": 4,
+      "decomposition_memory_bytes": 268435456
+    },
+    "qualification": {
+      "max_age_seconds": 604800
+    }
+  }
+}
