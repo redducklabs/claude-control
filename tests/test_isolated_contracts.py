@@ -1,5 +1,6 @@
 """Normative boundaries, owned authority, and fail-closed initial readiness."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -21,6 +22,15 @@ SHA = "b" * 40
 RESOURCE = (
     Path(__file__).parents[1] / "claude_control/isolated/resources/contracts.json"
 )
+PRIOR_AMENDMENT = (
+    "sha256:9dd9ba60651c55111870ed26b3fec25f98f84e602902671d5e7f35bd22bce3aa"
+)
+
+
+def _prior_contract_bytes():
+    data = RESOURCE.read_bytes()
+    current = json.loads(data)["amendment_digest"].encode("ascii")
+    return data.replace(current, PRIOR_AMENDMENT.encode("ascii"), 1)
 
 
 def test_verifier_limits_preserve_exception_without_relaxing_stores():
@@ -237,33 +247,44 @@ def test_shipped_bundle_and_schema_are_digest_pinned(tmp_path, monkeypatch):
         load_contract(path)
 
 
-def test_contract_binds_approved_amendment_and_refuses_prior_identity(
-    tmp_path, monkeypatch
-):
-    import claude_control.isolated.contracts as contracts
+def test_contract_binds_current_approved_amendment():
     from claude_control.isolated.contracts import ContractBundle
 
-    approved = "sha256:9dd9ba60651c55111870ed26b3fec25f98f84e602902671d5e7f35bd22bce3aa"
-    prior = "sha256:86c5c08e3da4283bbf037a7835b8b9b0091b3135f3588f05c66d2137884999b8"
+    approved = "sha256:551aa070f9472be576060545feda8a86a61ec709f43ceacfa9b61013421f5229"
 
-    bundle = load_contract(RESOURCE)
-    assert bundle.amendment_digest == approved
+    assert load_contract(RESOURCE).amendment_digest == approved
+    assert (
+        ContractBundle(**json.loads(RESOURCE.read_bytes())).amendment_digest == approved
+    )
 
-    prior_data = json.loads(RESOURCE.read_bytes())
-    prior_data["amendment_digest"] = prior
+
+def test_contract_bundle_refuses_superseded_amendment_identity():
+    from claude_control.isolated.contracts import ContractBundle
+
+    prior_data = json.loads(_prior_contract_bytes())
     with pytest.raises(Refusal):
         ContractBundle(**prior_data)
 
+
+def test_caller_loaded_contract_refuses_superseded_amendment_identity(tmp_path):
     prior_path = tmp_path / "prior-contract.json"
-    prior_path.write_text(json.dumps(prior_data), encoding="utf-8")
+    prior_path.write_bytes(_prior_contract_bytes())
     with pytest.raises(Refusal):
         load_contract(prior_path)
 
+
+def test_installed_contract_refuses_superseded_amendment_identity(
+    tmp_path, monkeypatch
+):
+    import claude_control.isolated.contracts as contracts
+
+    prior_bytes = _prior_contract_bytes()
+    assert hashlib.sha256(prior_bytes).hexdigest() == (
+        "d5d4d6f7cd30602c8c3b9b6b84ef06c70f0556ea8229f401507d0cce34c98a27"
+    )
     prior_resources = tmp_path / "prior-resources"
     prior_resources.mkdir()
-    (prior_resources / "contracts.json").write_text(
-        json.dumps(prior_data), encoding="utf-8"
-    )
+    (prior_resources / "contracts.json").write_bytes(prior_bytes)
     (prior_resources / "result-schema.json").write_bytes(
         RESOURCE.with_name("result-schema.json").read_bytes()
     )
