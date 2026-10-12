@@ -257,6 +257,12 @@ class _Contract:
             is None
         ):
             _refuse("job_id must be a canonical UUIDv7")
+        if (
+            isinstance(self, AdmissionSnapshot)
+            and self.journal_head is not None
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", self.journal_head) is None
+        ):
+            _refuse("journal_head must be a SHA-256 commitment")
 
 
 @dataclass(frozen=True)
@@ -332,6 +338,7 @@ class AdmissionSnapshot(_Contract):
     pairs: tuple[tuple[str, PairObservation, PairObservation], ...]
     orphan_ids: tuple[str, ...]
     observed_at_ns: int
+    journal_head: str | None = None
 
 
 @dataclass(frozen=True)
@@ -447,6 +454,9 @@ class ContractBundle(_Contract):
 
 
 class AdmissionObserver(Protocol):
+    @property
+    def required_space_targets(self) -> tuple[tuple[str, ...], tuple[str, ...]]: ...
+
     def observe_admission(self, job_id: str) -> AdmissionSnapshot: ...
 
 
