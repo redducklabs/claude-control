@@ -1,0 +1,490 @@
+name: A1 bootstrap inventory
+
+on:
+  push:
+    branches:
+      - codex/a1-bootstrap-qualification
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.head.ref == 'codex/a1-bootstrap-qualification')
+    runs-on: redducklabs-runners
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the triggering revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Record bounded toolchain inventory
+        id: inventory
+        shell: bash
+        run: |
+          set -uo pipefail
+          umask 077
+          export PATH=/usr/bin:/bin
+          export LC_ALL=C
+          export LANG=C
+          cd /
+
+          fail=0
+          reason_file=
+          artifact_dir=
+          work_dir=
+          if [[ -z "${RUNNER_TEMP:-}" || -z "${GITHUB_WORKSPACE:-}" || -z "${GITHUB_OUTPUT:-}" ]]; then
+            printf '%s\n' 'required GitHub runner paths are unavailable' >&2
+            exit 70
+          fi
+
+          runner_temp=$(cd "$RUNNER_TEMP" 2>/dev/null && pwd -P) || exit 70
+          workspace=$(cd "$GITHUB_WORKSPACE" 2>/dev/null && pwd -P) || exit 70
+          case "$runner_temp/" in
+            "$workspace/"*) printf '%s\n' 'RUNNER_TEMP resolves inside the checkout' >&2; exit 70 ;;
+          esac
+          work_dir=$(mktemp -d "$runner_temp/a1-inventory.XXXXXXXX") || exit 70
+          artifact_dir=$work_dir/artifact
+          mkdir -m 700 -- "$artifact_dir" "$work_dir/captures"
+          reason_file=$work_dir/reasons
+          : > "$reason_file"
+
+          log=$artifact_dir/inventory.log
+          json=$artifact_dir/inventory.json
+          exit_file=$artifact_dir/inventory.exit-code
+          : > "$log"
+
+          note_failure() {
+            fail=1
+            printf '%s\n' "$1" >> "$reason_file"
+          }
+
+          json_string() {
+            local value=$1
+            value=${value//\\/\\\\}
+            value=${value//\"/\\\"}
+            value=${value//$'\n'/\\n}
+            value=${value//$'\r'/\\r}
+            value=${value//$'\t'/\\t}
+            printf '"%s"' "$value"
+          }
+
+          capture() {
+            local label=$1
+            shift
+            local safe_label=${label//[^a-zA-Z0-9_.-]/_}
+            local out=$work_dir/captures/$safe_label.stdout
+            local err=$work_dir/captures/$safe_label.stderr
+            local bound_ready=$work_dir/captures/$safe_label.bound-ready
+            local status=0
+            local out_size err_size
+            printf '\n--- %s ---\nargv:' "$label" >> "$log"
+            printf ' %q' "$@" >> "$log"
+            printf '\n' >> "$log"
+            (ulimit -f 64 || exit 125; [[ "$(ulimit -f 2>/dev/null)" == 64 ]] || exit 125; : > "$bound_ready" || exit 125; exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C LANG=C timeout --signal=TERM --kill-after=2s 8s "$@") > "$out" 2> "$err" || status=$?
+            CAPTURE_VALID=0
+            if [[ -f "$bound_ready" ]]; then
+              CAPTURE_VALID=1
+            else
+              note_failure "could not establish the 32 KiB output bound: $label"
+            fi
+            out_size=$(stat -c %s -- "$out" 2>/dev/null || true)
+            err_size=$(stat -c %s -- "$err" 2>/dev/null || true)
+            if [[ ! "$out_size" =~ ^[0-9]+$ || ! "$err_size" =~ ^[0-9]+$ ]]; then
+              note_failure "metadata output size could not be observed: $label"
+              CAPTURE_VALID=0
+            elif (( out_size >= 32768 || err_size >= 32768 )); then
+              note_failure "metadata output reached the 32 KiB bound and may be truncated: $label"
+              CAPTURE_VALID=0
+            fi
+            printf 'exit: %s\nstdout:\n' "$status" >> "$log"
+            cat -- "$out" >> "$log"
+            printf '\nstderr:\n' >> "$log"
+            cat -- "$err" >> "$log"
+            printf '\n' >> "$log"
+            if [[ ! -s "$out" && ! -s "$err" ]]; then
+              note_failure "empty metadata output: $label"
+              CAPTURE_VALID=0
+            fi
+            CAPTURE_STATUS=$status
+          }
+
+          observe_regular_file() {
+            local label=$1 source_path=$2 resolved_before resolved_after identity_before identity_after hash_line hash_after digest digest_after probe_status
+            if [[ -z "$source_path" || "$source_path" != /* || "$source_path" == *$'\n'* || "$source_path" == *$'\r'* ]]; then
+              note_failure "malformed absolute file path: $label"
+              return 1
+            fi
+            resolved_before=$(readlink -f -- "$source_path" 2>> "$log")
+            probe_status=$?
+            printf '%s.resolve-before.exit=%s\n' "$label" "$probe_status" >> "$log"
+            printf '%s.resolve-before.stdout=%q\n' "$label" "$resolved_before" >> "$log"
+            if (( probe_status != 0 )); then
+              note_failure "file path resolution failed: $label"
+              return 1
+            fi
+            if [[ -z "$resolved_before" || "$resolved_before" != /* || "$resolved_before" == *$'\n'* || "$resolved_before" == *$'\r'* || -L "$resolved_before" || ! -f "$resolved_before" || ! -r "$resolved_before" ]]; then
+              note_failure "resolved object is not a readable regular file: $label"
+              return 1
+            fi
+            identity_before=$(stat -Lc '%d:%i:%f:%u:%g:%a:%s' -- "$resolved_before" 2>> "$log")
+            probe_status=$?
+            printf '%s.stat-before.exit=%s\n' "$label" "$probe_status" >> "$log"
+            printf '%s.stat-before.stdout=%q\n' "$label" "$identity_before" >> "$log"
+            if (( probe_status != 0 )); then
+              note_failure "initial file identity observation failed: $label"
+              return 1
+            fi
+            if [[ ! "$identity_before" =~ ^[0-9]+:[0-9]+:[0-9a-fA-F]+:[0-9]+:[0-9]+:[0-7]+:[0-9]+$ || "$identity_before" == *$'\n'* ]]; then
+              note_failure "initial file identity is malformed: $label"
+              return 1
+            fi
+            hash_line=$(sha256sum -- "$resolved_before" 2>> "$log")
+            probe_status=$?
+            printf '%s.sha256-before.exit=%s\n' "$label" "$probe_status" >> "$log"
+            printf '%s.sha256-before.stdout=%q\n' "$label" "$hash_line" >> "$log"
+            if (( probe_status != 0 )); then
+              note_failure "file hash observation failed: $label"
+              return 1
+            fi
+            if [[ ! "$hash_line" =~ ^([0-9a-f]{64})([[:space:]][[:space:]]|[[:space:]]\*).+$ || "$hash_line" == *$'\n'* ]]; then
+              note_failure "file hash is malformed: $label"
+              return 1
+            fi
+            digest=${BASH_REMATCH[1]}
+            hash_after=$(sha256sum -- "$resolved_before" 2>> "$log")
+            probe_status=$?
+            printf '%s.sha256-after.exit=%s\n' "$label" "$probe_status" >> "$log"
+            printf '%s.sha256-after.stdout=%q\n' "$label" "$hash_after" >> "$log"
+            if (( probe_status != 0 )); then
+              note_failure "final file hash observation failed: $label"
+              return 1
+            fi
+            if [[ ! "$hash_after" =~ ^([0-9a-f]{64})([[:space:]][[:space:]]|[[:space:]]\*).+$ || "$hash_after" == *$'\n'* ]]; then
+              note_failure "final file hash is malformed: $label"
+              return 1
+            fi
+            digest_after=${BASH_REMATCH[1]}
+            identity_after=$(stat -Lc '%d:%i:%f:%u:%g:%a:%s' -- "$resolved_before" 2>> "$log")
+            probe_status=$?
+            printf '%s.stat-after.exit=%s\n' "$label" "$probe_status" >> "$log"
+            printf '%s.stat-after.stdout=%q\n' "$label" "$identity_after" >> "$log"
+            if (( probe_status != 0 )); then
+              note_failure "final file identity observation failed: $label"
+              return 1
+            fi
+            resolved_after=$(readlink -f -- "$source_path" 2>> "$log")
+            probe_status=$?
+            printf '%s.resolve-after.exit=%s\n' "$label" "$probe_status" >> "$log"
+            printf '%s.resolve-after.stdout=%q\n' "$label" "$resolved_after" >> "$log"
+            if (( probe_status != 0 )); then
+              note_failure "final file path resolution failed: $label"
+              return 1
+            fi
+            if [[ ! "$identity_after" =~ ^[0-9]+:[0-9]+:[0-9a-fA-F]+:[0-9]+:[0-9]+:[0-7]+:[0-9]+$ || "$identity_after" != "$identity_before" || "$resolved_after" != "$resolved_before" || "$digest_after" != "$digest" || -L "$resolved_after" || ! -f "$resolved_after" || ! -r "$resolved_after" ]]; then
+              note_failure "file object changed during observation: $label"
+              return 1
+            fi
+            printf '%s.path=%s\n%s.resolved=%s\n%s.identity=%s\n%s.sha256=%s\n' "$label" "$source_path" "$label" "$resolved_before" "$label" "$identity_before" "$label" "$digest" >> "$log"
+            return 0
+          }
+
+          tool_path() {
+            local name=$1
+            local found resolved probe_status
+            found=$(command -v -- "$name" 2>/dev/null || true)
+            if [[ -z "$found" || "$found" != /* ]]; then
+              printf 'tool missing: %s\n' "$name" >> "$log"
+              note_failure "missing tool: $name"
+              return 1
+            fi
+            resolved=$(readlink -f -- "$found" 2>> "$log")
+            probe_status=$?
+            printf 'tool %s resolve.exit=%s\n' "$name" "$probe_status" >> "$log"
+            if (( probe_status != 0 )); then
+              printf 'tool path unresolved: %s (%s)\n' "$name" "$found" >> "$log"
+              note_failure "unresolved tool identity: $name"
+              return 1
+            fi
+            if [[ ! -x "$resolved" ]]; then
+              printf 'tool not executable: %s (%s)\n' "$name" "$resolved" >> "$log"
+              note_failure "not executable: $name"
+              return 1
+            fi
+            printf 'tool %s selected=%s resolved=%s\n' "$name" "$found" "$resolved" >> "$log"
+            observe_regular_file "tool.$name" "$resolved" || return 1
+            TOOL_PATH=$resolved
+            return 0
+          }
+
+          printf 'A1 bootstrap test-only inventory\n' >> "$log"
+          printf 'runner.os=%s\nrunner.arch=%s\n' "${RUNNER_OS:-unknown}" "${RUNNER_ARCH:-unknown}" >> "$log"
+
+          head_sha=$(git -C "$workspace" rev-parse HEAD 2>/dev/null || true)
+          tree_sha=$(git -C "$workspace" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
+          workflow_hash=$(sha256sum -- "$workspace/.github/workflows/a1-bootstrap-tests.yml" 2>/dev/null || true)
+          workflow_hash=${workflow_hash%% *}
+          [[ "$head_sha" =~ ^[0-9a-f]{40,64}$ ]] || note_failure 'checkout HEAD identity unavailable'
+          [[ "$tree_sha" =~ ^[0-9a-f]{40,64}$ ]] || note_failure 'checkout tree identity unavailable'
+          [[ "$workflow_hash" =~ ^[0-9a-f]{64}$ ]] || note_failure 'workflow source hash unavailable'
+          printf 'checkout.head=%s\ncheckout.tree=%s\nworkflow.sha256=%s\n' "${head_sha:-unavailable}" "${tree_sha:-unavailable}" "${workflow_hash:-unavailable}" >> "$log"
+
+          os_name=$(uname -s 2>/dev/null || printf 'unavailable')
+          architecture=$(uname -m 2>/dev/null || printf 'unavailable')
+          printf 'uname.system=%s\nuname.machine=%s\n' "$os_name" "$architecture" >> "$log"
+          if [[ "$os_name" != Linux ]]; then
+            note_failure "unsupported runner OS: $os_name (Linux required)"
+          fi
+
+          if [[ "$os_name" == Linux ]]; then
+            # Capture all existing compiler candidates; no compilation is performed.
+            compiler=
+            for candidate in cc gcc clang; do
+              candidate_found=$(command -v -- "$candidate" 2>/dev/null || true)
+              if [[ -z "$candidate_found" ]]; then
+                printf 'compiler candidate not present: %s\n' "$candidate" >> "$log"
+                continue
+              fi
+              if tool_path "$candidate"; then
+                candidate_path=$TOOL_PATH
+                [[ -n "$compiler" ]] || compiler=$candidate_path
+                capture "$candidate version" "$candidate_path" --version
+                [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]] || note_failure "compiler version query failed: $candidate"
+                capture "$candidate static libc query" "$candidate_path" -print-file-name=libc.a
+                if [[ "$CAPTURE_STATUS" != 0 || "$CAPTURE_VALID" != 1 ]]; then
+                  note_failure "static libc query failed or was incomplete: $candidate"
+                else
+                  query_file=$work_dir/captures/${candidate//[^a-zA-Z0-9_.-]/_}_static_libc_query.stdout
+                  query_lines=$(wc -l < "$query_file" 2>/dev/null || true)
+                  static_path=$(cat -- "$query_file" 2>/dev/null || true)
+                  if [[ "$query_lines" != 1 || -z "$static_path" || "$static_path" == libc.a || "$static_path" != /* ]]; then
+                    note_failure "static libc query output is malformed or unavailable: $candidate"
+                  else
+                    observe_regular_file "static-libc.$candidate" "$static_path"
+                  fi
+                fi
+              fi
+            done
+            [[ -n "$compiler" ]] || note_failure 'no existing cc, gcc, or clang compiler found'
+
+            for candidate in ld ar; do
+              if tool_path "$candidate"; then
+                candidate_path=$TOOL_PATH
+                capture "$candidate version" "$candidate_path" --version
+                [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]] || note_failure "tool version query failed: $candidate"
+              fi
+            done
+
+            if tool_path ldd; then
+              ldd_path=$TOOL_PATH
+              capture 'libc version' "$ldd_path" --version
+              [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]] || note_failure 'libc version query failed'
+              capture 'linked libc identity' "$ldd_path" /usr/bin/env
+              if [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]]; then
+                libc_matches=$(sed -nE 's/^[[:space:]]*libc\.so[^ ]*[[:space:]]+=>[[:space:]]+([^ ]+).*/\1/p' "$work_dir/captures/linked_libc_identity.stdout" 2>/dev/null) || {
+                  note_failure 'linked libc path parse failed'
+                  libc_matches=
+                }
+                if [[ -z "$libc_matches" || "$libc_matches" == *$'\n'* ]]; then
+                  note_failure 'linked libc path is missing or ambiguous'
+                else
+                  observe_regular_file linked-libc "$libc_matches"
+                fi
+              else
+                note_failure 'linked libc inspection failed or was incomplete'
+              fi
+            fi
+
+            if tool_path getconf; then
+              getconf_path=$TOOL_PATH
+              capture 'libc configuration version' "$getconf_path" GNU_LIBC_VERSION
+              [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]] || note_failure 'GNU libc version unavailable'
+            fi
+
+            python_path=
+            python_found=$(command -v -- python3 2>/dev/null || true)
+            if [[ -n "$python_found" ]] && tool_path python3; then
+              python_path=$TOOL_PATH
+            else
+              python_found=$(command -v -- python 2>/dev/null || true)
+              if [[ -n "$python_found" ]] && tool_path python; then
+                python_path=$TOOL_PATH
+              else
+                note_failure 'existing Python interpreter not found'
+              fi
+            fi
+            if [[ -n "$python_path" ]]; then
+              capture 'Python version' "$python_path" --version
+              [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]] || note_failure 'Python version query failed'
+              capture 'Python and pytest import identity' "$python_path" -I -c 'import importlib.util, importlib.metadata, sys; p=importlib.util.find_spec("pytest"); print("executable=" + sys.executable); print("version=" + sys.version.replace("\n", " ")); print("pytest_origin=" + (p.origin if p else "missing")); print("pytest_version=" + (importlib.metadata.version("pytest") if p else "missing"))'
+              if [[ "$CAPTURE_STATUS" != 0 || "$CAPTURE_VALID" != 1 ]] || ! grep -q '^pytest_origin=' "$work_dir/captures/Python_and_pytest_import_identity.stdout" || grep -q '^pytest_origin=missing$' "$work_dir/captures/Python_and_pytest_import_identity.stdout"; then
+                note_failure 'pytest import identity unavailable'
+              fi
+            fi
+
+            if tool_path pytest; then
+              pytest_path=$TOOL_PATH
+              capture 'pytest version' "$pytest_path" --version
+              [[ "$CAPTURE_STATUS" == 0 && "$CAPTURE_VALID" == 1 ]] || note_failure 'pytest version query failed'
+            else
+              note_failure 'existing pytest executable not found'
+            fi
+          fi
+
+          if [[ ! -s "$log" ]]; then
+            note_failure 'inventory log is empty'
+          fi
+          if (( fail == 0 )); then
+            status=0
+            state=inventory-complete
+          else
+            status=20
+            state=prerequisite-failure
+          fi
+          printf '%s\n' "$status" > "$exit_file"
+          {
+            printf '{\n  "schema_version": 1,\n  "status": '
+            json_string "$state"
+            printf ',\n  "checkout_head": '
+            json_string "${head_sha:-unavailable}"
+            printf ',\n  "checkout_tree": '
+            json_string "${tree_sha:-unavailable}"
+            printf ',\n  "workflow_sha256": '
+            json_string "${workflow_hash:-unavailable}"
+            printf ',\n  "runner_os": '
+            json_string "$os_name"
+            printf ',\n  "runner_architecture": '
+            json_string "$architecture"
+            printf ',\n  "prerequisites": ['
+            sep=
+            while IFS= read -r reason; do
+              [[ -n "$reason" ]] || continue
+              printf '%s\n    ' "$sep"
+              json_string "$reason"
+              sep=,
+            done < "$reason_file"
+            printf '\n  ]\n}\n'
+          } > "$json"
+
+          # Capture scratch remains private under RUNNER_TEMP and is never uploaded.
+          printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Validate the exact inventory artifact allowlist
+        id: artifact_guard
+        if: always()
+        shell: bash
+        env:
+          INVENTORY_DIR: ${{ steps.inventory.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+          test -n "$INVENTORY_DIR"
+          test -d "$INVENTORY_DIR"
+          parser=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+          test -n "$parser"
+          [[ "$parser" == /* ]]
+          test -x "$parser"
+          /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C LANG=C "$parser" -I -S - "$INVENTORY_DIR" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          directory = sys.argv[1]
+          directory_stat = os.stat(directory, follow_symlinks=False)
+          if not stat.S_ISDIR(directory_stat.st_mode):
+              raise SystemExit("inventory artifact path is not a real directory")
+
+          expected_files = {
+              "inventory.json",
+              "inventory.log",
+              "inventory.exit-code",
+          }
+          with os.scandir(directory) as entries:
+              entry_list = list(entries)
+          if {entry.name for entry in entry_list} != expected_files:
+              raise SystemExit("inventory artifact entry allowlist mismatch")
+          for entry in entry_list:
+              entry_stat = entry.stat(follow_symlinks=False)
+              if entry.is_symlink() or not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_size <= 0:
+                  raise SystemExit("inventory artifact contains a nonregular or empty entry")
+
+          def reject_duplicate_keys(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON key")
+                  result[key] = value
+              return result
+
+          def reject_nonfinite(value):
+              raise ValueError("nonfinite JSON value")
+
+          with open(os.path.join(directory, "inventory.json"), "rb") as source:
+              document = json.loads(
+                  source.read().decode("utf-8"),
+                  object_pairs_hook=reject_duplicate_keys,
+                  parse_constant=reject_nonfinite,
+              )
+          required_keys = {
+              "schema_version",
+              "status",
+              "checkout_head",
+              "checkout_tree",
+              "workflow_sha256",
+              "runner_os",
+              "runner_architecture",
+              "prerequisites",
+          }
+          if type(document) is not dict or set(document) != required_keys:
+              raise SystemExit("inventory JSON closed schema mismatch")
+          if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+              raise SystemExit("inventory JSON schema version mismatch")
+          for key in ("checkout_head", "checkout_tree"):
+              value = document[key]
+              if type(value) is not str or (value != "unavailable" and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None):
+                  raise SystemExit("inventory checkout identity is malformed")
+          workflow_hash = document["workflow_sha256"]
+          if type(workflow_hash) is not str or (workflow_hash != "unavailable" and re.fullmatch(r"[0-9a-f]{64}", workflow_hash) is None):
+              raise SystemExit("inventory workflow hash is malformed")
+          for key in ("runner_os", "runner_architecture"):
+              if type(document[key]) is not str or not document[key]:
+                  raise SystemExit("inventory runner identity is malformed")
+          prerequisites = document["prerequisites"]
+          if type(prerequisites) is not list or any(type(item) is not str or not item for item in prerequisites):
+              raise SystemExit("inventory prerequisite list is malformed")
+          with open(os.path.join(directory, "inventory.exit-code"), "rb") as source:
+              exit_code = source.read()
+          if document["status"] == "inventory-complete":
+              if prerequisites or exit_code != b"0\n":
+                  raise SystemExit("inventory success status and exit code disagree")
+              if "unavailable" in (document["checkout_head"], document["checkout_tree"], workflow_hash):
+                  raise SystemExit("inventory success lacks source identity")
+          elif document["status"] == "prerequisite-failure":
+              if not prerequisites or exit_code != b"20\n":
+                  raise SystemExit("inventory prerequisite status and exit code disagree")
+          else:
+              raise SystemExit("unknown inventory status")
+          PY
+          printf 'valid=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Upload curated inventory evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.artifact_guard.outputs.valid == 'true'
+        with:
+          name: a1-bootstrap-inventory
+          path: |
+            ${{ steps.inventory.outputs.artifact_dir }}/inventory.json
+            ${{ steps.inventory.outputs.artifact_dir }}/inventory.log
+            ${{ steps.inventory.outputs.artifact_dir }}/inventory.exit-code
+          if-no-files-found: error
