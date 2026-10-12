@@ -477,7 +477,7 @@ class RuntimePort(Protocol):
 
 
 _RESOURCES = Path(__file__).with_name("resources")
-_CONTRACT_SHA256 = "fa1009846579efb3cd13fc6ac5e988ccba9dbf2ebf690b3368f2af9d798a9e91"
+_CONTRACT_SHA256 = "d5d4d6f7cd30602c8c3b9b6b84ef06c70f0556ea8229f401507d0cce34c98a27"
 
 
 def _read_resource(path: Path) -> bytes:

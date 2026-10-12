@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "spec_digest": "sha256:85150e0523ea515d500968a1d277e4327ecc2b96ba9d8dafa2c4627ae5631e19",
-  "amendment_digest": "sha256:86c5c08e3da4283bbf037a7835b8b9b0091b3135f3588f05c66d2137884999b8",
+  "amendment_digest": "sha256:9dd9ba60651c55111870ed26b3fec25f98f84e602902671d5e7f35bd22bce3aa",
   "schema_digest": "sha256:f4d1a1becb0931766fdf9bf0212ff4d1fb0963aff47d6060ed992e2b0326ab27",
   "exclusion_inventory_version": 8,
   "observer_algorithm_version": 5,

@@ -237,6 +237,41 @@ def test_shipped_bundle_and_schema_are_digest_pinned(tmp_path, monkeypatch):
         load_contract(path)
 
 
+def test_contract_binds_approved_amendment_and_refuses_prior_identity(
+    tmp_path, monkeypatch
+):
+    import claude_control.isolated.contracts as contracts
+    from claude_control.isolated.contracts import ContractBundle
+
+    approved = "sha256:9dd9ba60651c55111870ed26b3fec25f98f84e602902671d5e7f35bd22bce3aa"
+    prior = "sha256:86c5c08e3da4283bbf037a7835b8b9b0091b3135f3588f05c66d2137884999b8"
+
+    bundle = load_contract(RESOURCE)
+    assert bundle.amendment_digest == approved
+
+    prior_data = json.loads(RESOURCE.read_bytes())
+    prior_data["amendment_digest"] = prior
+    with pytest.raises(Refusal):
+        ContractBundle(**prior_data)
+
+    prior_path = tmp_path / "prior-contract.json"
+    prior_path.write_text(json.dumps(prior_data), encoding="utf-8")
+    with pytest.raises(Refusal):
+        load_contract(prior_path)
+
+    prior_resources = tmp_path / "prior-resources"
+    prior_resources.mkdir()
+    (prior_resources / "contracts.json").write_text(
+        json.dumps(prior_data), encoding="utf-8"
+    )
+    (prior_resources / "result-schema.json").write_bytes(
+        RESOURCE.with_name("result-schema.json").read_bytes()
+    )
+    monkeypatch.setattr(contracts, "_RESOURCES", prior_resources)
+    with pytest.raises(Refusal):
+        load_contract(prior_resources / "contracts.json")
+
+
 def test_json_resources_are_pinned_to_lf_bytes_in_git():
     import subprocess
 
